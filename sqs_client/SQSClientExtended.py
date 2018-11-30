@@ -7,6 +7,7 @@ import tempfile
 
 from enum import Enum
 from boto3.session import Session
+from botocore.exceptions import ClientError
 
 
 class SQSExtendedClientConstants(Enum):
@@ -245,17 +246,9 @@ class SQSClientExtended(object):
         """
         session = Session(aws_access_key_id=self.aws_access_key_id, aws_secret_access_key=self.aws_secret_access_key, region_name=self.aws_region_name)
         s3 = session.resource('s3')
-        bucket = s3.Bucket(s3_bucket_name)
-        objs = list(bucket.objects.filter(Prefix=s3_key))
-        if len(objs) > 0 and objs[0].key == s3_key:
-            data_file = tempfile.NamedTemporaryFile(mode='wb', delete=False)
-            bucket = s3.Bucket(s3_bucket_name)
-            object = bucket.Object(s3_key)
-            object.download_fileobj(data_file)
-            data_file.close()
-            with open(data_file.name, mode='r', encoding='utf-8') as data_file_reader:
-                response_data = data_file_reader
-            if os.path.exists(data_file.name):
-                os.remove(data_file.name)
-            return response_data
-        return None
+        try:
+            obj = s3.Object(s3_bucket_name, s3_key)
+        except ClientError:
+            return ""
+        else:
+            return obj.get()['Body'].read()
