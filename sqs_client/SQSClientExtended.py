@@ -187,11 +187,14 @@ class SQSClientExtended(object):
         print("receipt_handle={}".format(receipt_handle))
         self.sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
 
-    def send_message(self, queue_url, message, message_attributes={}):
+    def send_message(self, queue_url, message, message_attributes=None):
         """
         Delivers a message to the specified queue and uploads the message payload
         to Amazon S3 if necessary.
         """
+        if message_attributes is None:
+            message_attributes = {}
+
         if message is None:
             raise ValueError('message_body required')
 
