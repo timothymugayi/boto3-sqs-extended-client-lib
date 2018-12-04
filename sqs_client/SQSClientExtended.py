@@ -36,25 +36,33 @@ class SQSClientExtended(object):
     :param profile_name: The name of a profile to use. If not given, then the default profile is used.
     """
 
-    def __init__(self, aws_access_key_id=None, aws_secret_access_key=None, aws_region_name=None, s3_bucket_name=None):
+    def __init__(self, **kwargs):
+        aws_access_key_id = kwargs.get('aws_access_key_id')
+        aws_secret_access_key = kwargs.get('aws_secret_access_key')
+        aws_region_name = kwargs.get('region_name')
+        s3_bucket_name = kwargs.get('s3_bucket_name')
+        endpoint_url = kwargs.get('endpoint_url')
+
         self.aws_access_key_id = aws_access_key_id
         self.aws_secret_access_key = aws_secret_access_key
         self.aws_region_name = aws_region_name
         self.s3_bucket_name = s3_bucket_name
         self.message_size_threshold = SQSExtendedClientConstants.DEFAULT_MESSAGE_SIZE_THRESHOLD.value
         self.always_through_s3 = True
+
         if aws_access_key_id and aws_secret_access_key and aws_region_name:
             self.sqs = boto3.client(
                 'sqs',
                 aws_access_key_id=aws_access_key_id,
                 aws_secret_access_key=aws_secret_access_key,
-                region_name=aws_region_name
+                region_name=aws_region_name,
+                endpoint_url=endpoint_url
             )
         else:
             self.sqs = boto3.client('sqs')
 
     def is_large_payload_support_enabled(self):
-        True
+        return True
 
     def set_always_through_s3(self, always_through_s3):
         """
@@ -109,7 +117,7 @@ class SQSClientExtended(object):
         total_msg_size = msg_attributes_size + msg_body_size
         return (total_msg_size > self.message_size_threshold)
 
-    def receive_message(self, queue_url, max_number_Of_Messages=1, wait_time_seconds=10):
+    def receive_message(self, **kwargs):
         """
         Retrieves one or more messages (up to 10), from the specified queue. Using the WaitTimeSeconds parameter enables long-poll support
             The message body.
@@ -120,7 +128,16 @@ class SQSClientExtended(object):
             An MD5 digest of the message attributes.
             The receipt handle is the identifier you must provide when deleting the message
         """
-        response_opt_queue = self.sqs.receive_message(QueueUrl=queue_url, AttributeNames=['All'], MessageAttributeNames=['All', ], MaxNumberOfMessages=max_number_Of_Messages, WaitTimeSeconds=wait_time_seconds,)
+
+        queue_url = kwargs.get('QueueUrl')
+        max_number_of_messages = kwargs.get('MaxNumberOfMessages')
+        wait_time_seconds = kwargs.get('WaitTimeSeconds')
+
+        response_opt_queue = self.sqs.receive_message(QueueUrl=queue_url,
+                                                      AttributeNames=['All'],
+                                                      MessageAttributeNames=['All', ],
+                                                      MaxNumberOfMessages=max_number_of_messages,
+                                                      WaitTimeSeconds=wait_time_seconds)
         opt_messages = response_opt_queue.get('Messages', [])
         if not opt_messages:
             return None
@@ -170,7 +187,7 @@ class SQSClientExtended(object):
     def __is_s3_receipt_handle(self, receipt_handle):
         return True if SQSExtendedClientConstants.S3_BUCKET_NAME_MARKER.value in receipt_handle and SQSExtendedClientConstants.S3_KEY_MARKER.value in receipt_handle else False
 
-    def delete_message(self, queue_url, receipt_handle):
+    def delete_message(self, **kwargs):
         """
         Deletes the specified message from the specified queue. You specify the message
         by using the message's receipt handle and not the MessageId you receive when you
@@ -181,17 +198,26 @@ class SQSClientExtended(object):
 
         Additionally to purging the queue of the message any s3 referenced object will be deleted
         """
+
+        queue_url = kwargs.get('QueueUrl')
+        receipt_handle = kwargs.get('ReceiptHandle')
+
         if self.__is_s3_receipt_handle(receipt_handle):
             self.__delete_message_payload_from_s3(receipt_handle)
             receipt_handle = self.__get_orig_receipt_handle(receipt_handle)
         print("receipt_handle={}".format(receipt_handle))
         self.sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
 
-    def send_message(self, queue_url, message, message_attributes=None):
+    def send_message(self, **kwargs):
         """
         Delivers a message to the specified queue and uploads the message payload
         to Amazon S3 if necessary.
         """
+
+        queue_url = kwargs.get('QueueUrl')
+        message = kwargs.get('MessageBody')
+        message_attributes = kwargs.get('MessageAttributes')
+
         if message_attributes is None:
             message_attributes = {}
 
@@ -215,9 +241,12 @@ class SQSClientExtended(object):
                 raise ValueError('S3 bucket name cannot be null')
             s3_key_message = json.dumps(self.__store_message_in_s3(message))
             message_attributes[SQSExtendedClientConstants.RESERVED_ATTRIBUTE_NAME.value] = {'StringValue': str(self.__get_string_size_in_bytes(message)), 'DataType': 'Number'}
-            return self.sqs.send_message(QueueUrl=queue_url, MessageBody=s3_key_message, MessageAttributes=message_attributes)
+            return self.sqs.send_message(QueueUrl=queue_url,
+                                         MessageBody=s3_key_message,
+                                         MessageAttributes=message_attributes)
         else:
-            return self.sqs.send_message(QueueUrl=queue_url, MessageBody=message)
+            return self.sqs.send_message(QueueUrl=queue_url,
+                                         MessageBody=message)
 
     def __store_message_in_s3(self, message_body):
         """
