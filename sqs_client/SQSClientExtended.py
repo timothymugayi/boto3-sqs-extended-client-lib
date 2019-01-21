@@ -104,7 +104,7 @@ class SQSClientExtended(object):
 
 	def __is_large(self, message, message_attributes):
 		msg_attributes_size = self.__get_msg_attributes_size(message_attributes)
-		msg_body_size = self.__get_msg_attributes_size(message)
+		msg_body_size = self.__get_string_size_in_bytes(message)
 		total_msg_size = msg_attributes_size + msg_body_size
 		return (total_msg_size > self.message_size_threshold)
 
