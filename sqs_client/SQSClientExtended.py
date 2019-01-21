@@ -7,7 +7,7 @@ import tempfile
 
 from enum import Enum
 from boto3.session import Session
-
+from io import BytesIO
 
 class SQSExtendedClientConstants(Enum):
 	DEFAULT_MESSAGE_SIZE_THRESHOLD = 262144
@@ -248,14 +248,17 @@ class SQSClientExtended(object):
 		bucket = s3.Bucket(s3_bucket_name)
 		objs = list(bucket.objects.filter(Prefix=s3_key))
 		if len(objs) > 0 and objs[0].key == s3_key:
-			data_file = tempfile.NamedTemporaryFile(mode='wb', delete=False)
+			data_byte_io = BytesIO()
 			bucket = s3.Bucket(s3_bucket_name)
 			object = bucket.Object(s3_key)
-			object.download_fileobj(data_file)
-			data_file.close()
+			object.download_fileobj(data_byte_io)
+			return data_byte_io.read()
+			"""
+
 			with open(data_file.name, mode='r', encoding='utf-8') as data_file_reader:
-				response_data = data_file_reader
+				response_data = data_file_reader.read()
 			if os.path.exists(data_file.name):
 				os.remove(data_file.name)
 			return response_data
+			"""
 		return None
