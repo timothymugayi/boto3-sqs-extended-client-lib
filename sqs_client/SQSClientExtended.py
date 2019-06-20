@@ -254,7 +254,7 @@ class SQSClientExtended(object):
 			object.download_fileobj(data_file)
 			data_file.close()
 			with open(data_file.name, mode='r', encoding='utf-8') as data_file_reader:
-				response_data = data_file_reader
+				response_data = data_file_reader.read()
 			if os.path.exists(data_file.name):
 				os.remove(data_file.name)
 			return response_data
