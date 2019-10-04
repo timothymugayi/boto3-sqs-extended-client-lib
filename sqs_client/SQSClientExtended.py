@@ -213,7 +213,7 @@ class SQSClientExtended(object):
 			message_attributes[SQSExtendedClientConstants.RESERVED_ATTRIBUTE_NAME.value] = {'StringValue': str(self.__get_string_size_in_bytes(message)), 'DataType': 'Number'}
 			return self.sqs.send_message(QueueUrl=queue_url, MessageBody=s3_key_message, MessageAttributes=message_attributes)
 		else:
-			return self.sqs.send_message(QueueUrl=queue_url, MessageBody=message)
+			return self.sqs.send_message(QueueUrl=queue_url, MessageBody=message, MessageAttributes=message_attributes)
 
 	def __store_message_in_s3(self, message_body):
 		"""
