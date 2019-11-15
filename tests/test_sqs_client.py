@@ -8,6 +8,10 @@ from sqs_client.SQSClientExtended import SQSClientExtended
 
 from sqs_client.config import (AWS_SQS_QUEUE_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION)
 
+try:
+    FileNotFoundError
+except NameError:
+    FileNotFoundError = IOError
 
 def test_send_message_with_invalid_credentials():
 	with pytest.raises(FileNotFoundError) as e_info:
