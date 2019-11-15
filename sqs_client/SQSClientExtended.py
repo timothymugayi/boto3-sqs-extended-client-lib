@@ -7,6 +7,7 @@ import tempfile
 
 from enum import Enum
 from boto3.session import Session
+from io import BytesIO
 
 
 class SQSExtendedClientConstants(Enum):
@@ -132,7 +133,7 @@ class SQSClientExtended(object):
 						raise ValueError('Detected missing required key attribute s3BucketName and s3Key in s3 payload')
 					s3_bucket_name = message_body.get('s3BucketName')
 					s3_key = message_body.get('s3Key')
-					orig_msg_body = self.get_text_from_S3(s3_bucket_name, s3_key)
+					orig_msg_body = self.get_text_from_s3(s3_bucket_name, s3_key)
 					message['Body'] = orig_msg_body
 					# remove the additional attribute before returning the message to user.
 					message.get('MessageAttributes').pop(SQSExtendedClientConstants.RESERVED_ATTRIBUTE_NAME.value)
@@ -239,7 +240,7 @@ class SQSClientExtended(object):
 				str(e), type(e).__name__))
 			raise e
 
-	def get_text_from_S3(self, s3_bucket_name, s3_key):
+	def get_text_from_s3(self, s3_bucket_name, s3_key):
 		"""
 		Get string representation of a sqs object and store into original SQS message object
 		"""
@@ -247,15 +248,10 @@ class SQSClientExtended(object):
 		s3 = session.resource('s3')
 		bucket = s3.Bucket(s3_bucket_name)
 		objs = list(bucket.objects.filter(Prefix=s3_key))
-		if len(objs) > 0 and objs[0].key == s3_key:
-			data_file = tempfile.NamedTemporaryFile(mode='wb', delete=False)
+		if objs and objs[0].key == s3_key:
+			data_byte_io = BytesIO()
 			bucket = s3.Bucket(s3_bucket_name)
-			object = bucket.Object(s3_key)
-			object.download_fileobj(data_file)
-			data_file.close()
-			with open(data_file.name, mode='r', encoding='utf-8') as data_file_reader:
-				response_data = data_file_reader
-			if os.path.exists(data_file.name):
-				os.remove(data_file.name)
-			return response_data
+			bucket.Object(s3_key).download_fileobj(data_byte_io)
+			data_byte_io.seek(0)
+			return data_byte_io.read().decode('utf-8')
 		return None
