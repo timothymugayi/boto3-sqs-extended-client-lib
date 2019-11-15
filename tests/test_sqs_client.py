@@ -15,16 +15,16 @@ except NameError:
 
 def test_send_message_with_invalid_credentials():
 	with pytest.raises(FileNotFoundError) as e_info:
+		message = None
+		with open("C:\\DjangoCourse\\Courses\\celery\\introduction-promo.mp4", "rb") as image_file:
+			encoded_string = base64.b64encode(image_file.read())
+			message = encoded_string.decode("utf-8")
+
 		sqs = SQSClientExtended(AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION, 'tiptapcode-sqs-data')
 
 		# _100mb_large_string = ''.join([choice(ascii_letters + digits) for i in range(104857600)])
 
 		# message = "_100mb_large_string"
-
-		message = None
-		with open("C:\\DjangoCourse\\Courses\\celery\\introduction-promo.mp4", "rb") as image_file:
-			encoded_string = base64.b64encode(image_file.read())
-			message = encoded_string.decode("utf-8")
 
 		sqs.send_message(AWS_SQS_QUEUE_URL, message)
 
