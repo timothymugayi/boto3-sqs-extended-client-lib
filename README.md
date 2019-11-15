@@ -1,5 +1,9 @@
 Boto3 SQS Extended Client Library for Python
 ===========================================
+
+[![Build Status](https://travis-ci.org/timothymugayi/boto3-sqs-extended-client-lib.svg?branch=master)](https://travis-ci.org/timothymugayi/boto3-sqs-extended-client-lib)
+[![codecov](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib/branch/master/graph/badge.svg)](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib)
+
 The **Amazon SQS Extended Client Library for Python has been modelled after the original Amazon SQS Extended client library** This python library enables you to manage Amazon SQS message payloads with Amazon S3. This is especially useful for storing and retrieving messages with a message payload size greater than the current SQS limit of 256 KB, up to a maximum of 2 GB. Specifically, you can use this library to:
 
 * Specify whether message payloads are always stored in Amazon S3 or only when a message's size exceeds 256 KB.
