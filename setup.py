@@ -1,13 +1,25 @@
 import os
+import re
 
+from io import open as io_open
 from setuptools import setup, find_packages, Command
 
 
 with open("README.md", "r") as fh:
     long_description = fh.read()
 
-
 base_path = os.path.abspath(os.path.dirname(__file__))
+
+
+def readall(*args):
+    with io_open(os.path.join(base_path, *args), encoding="utf-8") as fp:
+        return fp.read()
+
+
+metadata = dict(
+    re.findall(r"""__([a-z]+)__ = "([^"]+)""", readall("pysqs_extended_client", "__init__.py"))
+)
+
 
 # What packages are required for this module to be executed?
 try:
@@ -20,17 +32,20 @@ except:
 class CleanCommand(Command):
     """Custom clean command to tidy up the project root."""
     user_options = []
+
     def initialize_options(self):
         pass
+
     def finalize_options(self):
         pass
+
     def run(self):
-        os.system('rm -vrf ./build ./dist ./*.pyc ./*.tgz ./*.egg-info')
+        os.system("rm -vrf ./build ./dist ./*.pyc ./*.tgz ./*.egg-info")
 
 
 setup(
-    name="boto3-sqs-extended-client",
-    version="0.0.1",
+    name="pysqs-extended-client",
+    version=metadata["version"],
     author="timothy.mugayi",
     author_email="django.course@gmail.com",
     description="Amazon SQS Extended Client Library for Python for sending large payloads that exceed sqs limitations via S3",
@@ -58,7 +73,7 @@ setup(
     ],
     zip_safe=True,
     install_requires=required_packages,
-    keywords='Amazon SQS Extended Client Library for Python',
+    keywords = ['SQS client python', 'SQS client', 'sqs extended client', 'aws sqs client', 'boto sqs client', 'large message sqs', 'sqs s3', 'sqs'],
     cmdclass={
         'clean': CleanCommand,
     }

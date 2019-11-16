@@ -16,7 +16,7 @@ install:
   - pip install codecov
 
 script:
-  - pytest -s --cov=sqs_client
+  - pytest -s --cov=pysqs_extended_client
 
 after_success:
   - codecov # submit coverage

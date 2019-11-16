@@ -1,12 +1,12 @@
 import pytest
 import base64
 
-from sqs_client.SQSClientExtended import SQSClientExtended
+from pysqs_extended_client.SQSClientExtended import SQSClientExtended
 
 # from string import ascii_letters, digits
 # from random import choice
 
-from sqs_client.config import (AWS_SQS_QUEUE_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION)
+from pysqs_extended_client.config import (AWS_SQS_QUEUE_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION)
 
 try:
     FileNotFoundError
