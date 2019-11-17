@@ -19,10 +19,16 @@ The **Amazon SQS Extended Client Library for Python has been modelled after the 
 * **Sign up for AWS** -- Before you begin, you need an AWS account. For more information about creating an AWS account and retrieving your AWS credentials, see [AWS Account and Credentials.
 * **Sign up for Amazon SQS** -- Go to the Amazon [SQS console](https://console.aws.amazon.com/sqs/home?region=us-east-1) to sign up for the service.
 
-* **Minimum requirements** -- To use the sample application, you'll need python 3 (and above)
+* **Minimum requirements** -- To use the sample application, you'll need python 2.7 recommended to use 3 (and above)
 
 * **Further information** - Read the [API documentation](http://aws.amazon.com/documentation/sqs/).
 
+
+## Installation
+
+Install using pip...
+
+```pip install pysqs-extended-client```
 
 ## Usage
 ```
@@ -59,5 +65,8 @@ The **Amazon SQS Extended Client Library for Python has been modelled after the 
 
 
 ## Feedback
+
+We use GitHub issues for tracking bugs and feature requests and have limited bandwidth to address them. Please use these community resources for getting help:
+
 * Give feedback [here](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/issues).
 * If you'd like to contribute a new feature or bug fix, go ahead submit a pull request.
