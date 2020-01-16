@@ -187,13 +187,16 @@ class SQSClientExtended(object):
 		print("receipt_handle={}".format(receipt_handle))
 		self.sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
 
-	def send_message(self, queue_url, message, message_attributes={}):
+	def send_message(self, queue_url, message, message_group_id=None, message_deduplication_id=None, message_attributes={}):
 		"""
 		Delivers a message to the specified queue and uploads the message payload
 		to Amazon S3 if necessary.
 		"""
 		if message is None:
 			raise ValueError('message_body required')
+
+                if not all([message_group_id, message_duplication_id]) and any([message_group_id, message_duplication_id]):
+                        raise ValueError('message_group_id and message_duplication_id are conditionally required together')
 
 		msg_attributes_size = self.__get_msg_attributes_size(message_attributes)
 		if msg_attributes_size > self.message_size_threshold:
@@ -212,9 +215,9 @@ class SQSClientExtended(object):
 				raise ValueError('S3 bucket name cannot be null')
 			s3_key_message = json.dumps(self.__store_message_in_s3(message))
 			message_attributes[SQSExtendedClientConstants.RESERVED_ATTRIBUTE_NAME.value] = {'StringValue': str(self.__get_string_size_in_bytes(message)), 'DataType': 'Number'}
-			return self.sqs.send_message(QueueUrl=queue_url, MessageBody=s3_key_message, MessageAttributes=message_attributes)
+			return self.sqs.send_message(QueueUrl=queue_url, MessageBody=s3_key_message, MessageGroupId=message_group_id, MessageDeduplicationId=message_deduplication_id, MessageAttributes=message_attributes)
 		else:
-			return self.sqs.send_message(QueueUrl=queue_url, MessageBody=message, MessageAttributes=message_attributes)
+			return self.sqs.send_message(QueueUrl=queue_url, MessageBody=message, MessageGroupId=message_group_id, MessageDeduplicationId=message_deduplication_id, MessageAttributes=message_attributes)
 
 	def __store_message_in_s3(self, message_body):
 		"""
