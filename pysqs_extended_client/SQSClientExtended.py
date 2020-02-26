@@ -195,8 +195,8 @@ class SQSClientExtended(object):
 		if message is None:
 			raise ValueError('message_body required')
 
-                if not all([message_group_id, message_duplication_id]) and any([message_group_id, message_duplication_id]):
-                        raise ValueError('message_group_id and message_duplication_id are conditionally required together')
+		if not all([message_group_id, message_duplication_id]) and any([message_group_id, message_duplication_id]):
+		        raise ValueError('message_group_id and message_duplication_id are conditionally required together')
 
 		msg_attributes_size = self.__get_msg_attributes_size(message_attributes)
 		if msg_attributes_size > self.message_size_threshold:
