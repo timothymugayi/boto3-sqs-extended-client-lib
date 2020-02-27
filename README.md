@@ -31,6 +31,9 @@ Install using pip...
 ```pip install pysqs-extended-client```
 
 ## Usage
+
+### Standard Queues
+
 ```
     import base64
 
@@ -55,6 +58,45 @@ Install using pip...
             message = encoded_string.decode("utf-8")
     
         sqs.send_message(AWS_SQS_QUEUE_URL, message)
+    
+        res = sqs.receive_message(AWS_SQS_QUEUE_URL)
+    
+        for message in res:
+            sqs.delete_message(AWS_SQS_QUEUE_URL, message.get('ReceiptHandle'))
+
+```
+
+### FIFO queues
+
+```
+    import base64
+    import uuid
+
+    from pysqs_extended_client.SQSClientExtended import SQSClientExtended
+    
+    # from string import ascii_letters, digits
+    # from random import choice
+    
+    from pysqs_extended_client.config import (AWS_SQS_QUEUE_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION)
+    
+    if __name__ == '__main__':
+    
+        sqs = SQSClientExtended(AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION, 'tiptapcode-sqs-data')
+    
+        # _100mb_large_string = ''.join([choice(ascii_letters + digits) for i in range(104857600)])
+    
+        # message = "_100mb_large_string"
+    
+        message = None
+        with open("C:\\DjangoCourse\\Courses\\celery\\introduction-promo.mp4", "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read())
+            message = encoded_string.decode("utf-8")
+
+        # Create group and deduplication IDs, required for FIFO queues.
+    		message_group_id = str(uuid.uuid4())
+        message_deduplication_id = str(uuid.uuid4())
+
+        sqs.send_message(AWS_SQS_QUEUE_URL, message, message_group_id=message_group_id, message_deduplication_id=message_deduplication_id)
     
         res = sqs.receive_message(AWS_SQS_QUEUE_URL)
     
