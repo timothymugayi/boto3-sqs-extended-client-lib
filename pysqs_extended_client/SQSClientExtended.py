@@ -187,11 +187,15 @@ class SQSClientExtended(object):
 		print("receipt_handle={}".format(receipt_handle))
 		self.sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
 
-	def _send_queue_message(self, queue_url, message_body, message_group_id, message_deduplication_id, message_attributes, fifo_queue):
-		if fifo_queue:
-			return self.sqs.send_message(QueueUrl=queue_url, MessageBody=message, MessageGroupId=message_group_id, MessageDeduplicationId=message_deduplication_id, MessageAttributes=message_attributes)
+	def _send_queue_message(self, queue_url, message_body, message_group_id, message_deduplication_id, message_attributes, is_fifo_queue):
+		"""
+		Helper function to send message to a regular queue vs. a fifo queue, depending on is_fifo_queue parameter.
+		is_fifo_queue determined by initial send_message call's message_group_id and message_deduplication_id parameters.
+		"""
+		if is_fifo_queue:
+			return self.sqs.send_message(QueueUrl=queue_url, MessageBody=message_body, MessageGroupId=message_group_id, MessageDeduplicationId=message_deduplication_id, MessageAttributes=message_attributes)
 		else:
-			return self.sqs.send_message(QueueUrl=queue_url, MessageBody=message, MessageAttributes=message_attributes)
+			return self.sqs.send_message(QueueUrl=queue_url, MessageBody=message_body, MessageAttributes=message_attributes)
 
 	def send_message(self, queue_url, message, message_group_id=None, message_deduplication_id=None, message_attributes={}):
 		"""
