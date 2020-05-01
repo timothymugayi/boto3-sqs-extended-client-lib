@@ -202,7 +202,6 @@ class SQSClientExtended(object):
 		Delivers a message to the specified queue and uploads the message payload
 		to Amazon S3 if necessary.
 		"""
-
                 if not message_attributes:
                     message_attributes = {}
 
