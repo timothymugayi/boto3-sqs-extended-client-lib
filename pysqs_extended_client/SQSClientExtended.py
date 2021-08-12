@@ -204,10 +204,13 @@ class SQSClientExtended(object):
 		Delivers a message to the specified queue and uploads the message payload
 		to Amazon S3 if necessary.
 		"""
-		if message is None:
+                if not message_attributes:
+                    message_attributes = {}
+
+                if message is None:
 			raise ValueError('message_body required')
 
-		fifo_queue = True
+                fifo_queue = True
 		if not all([message_group_id, message_deduplication_id]):
 			if any([message_group_id, message_deduplication_id]):
 			        raise ValueError('message_group_id and message_deduplication_id are conditionally required together')
