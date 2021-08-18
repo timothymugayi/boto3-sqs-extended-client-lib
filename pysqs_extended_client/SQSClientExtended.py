@@ -199,7 +199,7 @@ class SQSClientExtended(object):
 		else:
 			return self.sqs.send_message(QueueUrl=queue_url, MessageBody=message_body, MessageAttributes=message_attributes)
 
-	def send_message(self, queue_url, message, message_group_id=None, message_deduplication_id=None, message_attributes={}):
+	def send_message(self, queue_url, message, message_group_id=None, message_deduplication_id=None, message_attributes=None):
 		"""
 		Delivers a message to the specified queue and uploads the message payload
 		to Amazon S3 if necessary.
@@ -207,6 +207,17 @@ class SQSClientExtended(object):
 		if message is None:
 			raise ValueError('message_body required')
 
+		"""
+                message_attributes={} is dangerous if your function will modify the argument. 
+                If you modify a default argument, it will persist until the next call, 
+                so your "empty" dict will start to contain values on calls other than the first one.
+
+                Using None is both safe and conventional in cases where arguments with default value are not passed.
+		"""			
+
+                if message_attributes is None:
+                        message_attributes = dict()
+			
 		fifo_queue = True
 		if not all([message_group_id, message_deduplication_id]):
 			if any([message_group_id, message_deduplication_id]):
