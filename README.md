@@ -1,7 +1,7 @@
 Boto3 SQS Extended Client Library for Python
 ===========================================
 
-[![Build Status](https://travis-ci.org/timothymugayi/boto3-sqs-extended-client-lib.svg?branch=master)](https://travis-ci.org/timothymugayi/boto3-sqs-extended-client-lib)
+[![Tests](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/actions/workflows/tests.yml)
 [![codecov](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib/branch/master/graph/badge.svg)](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib)
 
 The **Amazon SQS Extended Client Library for Python** (version **0.2.0**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit, up to 2 GB) and puts a pointer on the queue.
