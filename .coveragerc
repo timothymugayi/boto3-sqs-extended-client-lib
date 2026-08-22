@@ -1,6 +1,7 @@
 [run]
-source=sqs_client
-omit=*/tests/*,
+source = pysqs_extended_client
+omit =
+    */tests/*
 
 [report]
 exclude_lines =

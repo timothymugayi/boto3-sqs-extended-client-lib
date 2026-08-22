@@ -1,0 +1,20 @@
+services:
+  localstack:
+    image: localstack/localstack:2026.07
+    container_name: sqs-extended-localstack
+    ports:
+      - "127.0.0.1:4566:4566"
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+      DEBUG: "0"
+      SQS_EXTENDED_S3_BUCKET: sqs-extended-payloads
+      SQS_EXTENDED_QUEUE_NAME: sqs-extended-demo
+      SQS_EXTENDED_FIFO_QUEUE_NAME: sqs-extended-demo.fifo
+    volumes:
+      - ./docker/ready.d:/etc/localstack/init/ready.d
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
