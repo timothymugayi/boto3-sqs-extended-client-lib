@@ -1,13 +1,15 @@
 services:
   localstack:
-    image: localstack/localstack:stable
+    # 4.14.0 is the last image that starts without LOCALSTACK_AUTH_TOKEN.
+    # Newer tags (2026.03+) need a token from https://app.localstack.cloud
+    image: ${LOCALSTACK_IMAGE:-localstack/localstack:4.14.0}
     container_name: sqs-extended-localstack
     ports:
       - "4566:4566"
     environment:
       AWS_DEFAULT_REGION: us-east-1
       DEBUG: "0"
-      GATEWAY_LISTEN: 0.0.0.0:4566
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
       SQS_EXTENDED_S3_BUCKET: sqs-extended-payloads
       SQS_EXTENDED_QUEUE_NAME: sqs-extended-demo
       SQS_EXTENDED_FIFO_QUEUE_NAME: sqs-extended-demo.fifo

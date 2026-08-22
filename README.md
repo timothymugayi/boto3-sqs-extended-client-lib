@@ -166,8 +166,10 @@ Call `sqs.close()` when the process is shutting down to stop the bounded S3 thre
 
 Use Docker Compose to run SQS and S3 locally. The init hook creates bucket `sqs-extended-payloads`, queue `sqs-extended-demo`, and FIFO queue `sqs-extended-demo.fifo`.
 
+The compose file pins `localstack/localstack:4.14.0` so it starts **without an account**. LocalStack 2026.03 and later require `LOCALSTACK_AUTH_TOKEN` (see [app.localstack.cloud](https://app.localstack.cloud)); you can override with `LOCALSTACK_IMAGE` and that env var.
+
 ```bash
-docker compose up -d --wait
+docker compose up -d
 ```
 
 Point the library at LocalStack with `endpoint_url` (dummy credentials are enough):
