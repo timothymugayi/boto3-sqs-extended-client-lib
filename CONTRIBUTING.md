@@ -15,12 +15,9 @@ pysqs-extended-client uses GitHub to manage reviews of pull requests.
 Submitted changes should pass the current tests, and be covered by new test
 cases when adding functionality.
 
-* Run the tests locally using [tox] which executes the full suite on all
-  supported Python versions installed.
+* Run the tests locally with ``pytest`` (see ``requirements-dev.txt``). LocalStack tests need ``docker compose up -d`` and ``pytest -m localstack``.
 
-* Each pull request is gated using [Travis CI] with the results linked on the
-  github page. This must pass before the change can land, note pushing a new
-  change will trigger a retest.
+* Each pull request is gated by [GitHub Actions](.github/workflows/tests.yml). That check must pass before the change can land; pushing a new commit retriggers it.
 
 ## Style
 
@@ -32,4 +29,3 @@ cases when adding functionality.
 [isort]: https://pypi.org/project/isort/
 [PEP 8]: https://www.python.org/dev/peps/pep-0008/
 [tox]: https://tox.readthedocs.io/en/latest/
-[Travis CI]: https://docs.travis-ci.com/

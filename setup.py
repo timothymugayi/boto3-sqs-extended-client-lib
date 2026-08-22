@@ -21,12 +21,20 @@ metadata = dict(
 )
 
 
-# What packages are required for this module to be executed?
-try:
-    with open(os.path.join(base_path, "requirements.txt"), encoding="utf-8") as f:
-        required_packages = f.read().split("\n")
-except:
-    required_packages = []
+def _load_requirements(filename):
+    try:
+        with open(os.path.join(base_path, filename), encoding="utf-8") as f:
+            return [
+                line.strip()
+                for line in f
+                if line.strip() and not line.startswith("#") and not line.startswith("-r ")
+            ]
+    except OSError:
+        return []
+
+
+required_packages = _load_requirements("requirements.txt")
+dev_packages = _load_requirements("requirements-dev.txt")
 
 
 class CleanCommand(Command):
@@ -73,6 +81,9 @@ setup(
     ],
     zip_safe=True,
     install_requires=required_packages,
+    extras_require={
+        "dev": dev_packages,
+    },
     keywords = ['SQS client python', 'SQS client', 'sqs extended client', 'aws sqs client', 'boto sqs client', 'large message sqs', 'sqs s3', 'sqs'],
     cmdclass={
         'clean': CleanCommand,
