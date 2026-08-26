@@ -37,6 +37,7 @@ class ExtendedClientConfiguration:
 		s3_max_concurrency=DEFAULT_S3_MAX_CONCURRENCY,
 		multipart_threshold=DEFAULT_MULTIPART_THRESHOLD,
 		endpoint_url=None,
+		s3_canned_acl=None,
 		on_event=None,
 	):
 		object.__setattr__(self, "_frozen", False)
@@ -56,6 +57,7 @@ class ExtendedClientConfiguration:
 		self.s3_max_concurrency = s3_max_concurrency
 		self.multipart_threshold = multipart_threshold
 		self.endpoint_url = endpoint_url
+		self.s3_canned_acl = s3_canned_acl
 		self.on_event = on_event
 
 	def freeze(self):

@@ -42,7 +42,10 @@ class FakeS3:
 		return {}
 
 	def upload_fileobj(self, Fileobj, Bucket, Key, ExtraArgs=None, Callback=None, Config=None):
-		return self.put_object(Bucket=Bucket, Key=Key, Body=Fileobj.read())
+		kwargs = {"Bucket": Bucket, "Key": Key, "Body": Fileobj.read()}
+		if ExtraArgs:
+			kwargs["ExtraArgs"] = ExtraArgs
+		return self.put_object(**kwargs)
 
 	def get_object(self, **kwargs):
 		if self.sleep_seconds:

@@ -4,7 +4,7 @@ Boto3 SQS Extended Client Library for Python
 [![Tests](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/actions/workflows/tests.yml)
 [![codecov](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib/branch/master/graph/badge.svg)](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib)
 
-The **Amazon SQS Extended Client Library for Python** (version **0.2.0**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit, up to 2 GB) and puts a pointer on the queue.
+The **Amazon SQS Extended Client Library for Python** (version **0.2.1**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit, up to 2 GB) and puts a pointer on the queue.
 
 You can:
 
@@ -23,9 +23,19 @@ You can:
 
 ## Installation
 
+PyPI still publishes **0.0.1** only. Until that project can be updated, install from GitHub:
+
+```bash
+pip install "pysqs-extended-client @ git+https://github.com/timothymugayi/boto3-sqs-extended-client-lib.git@v0.2.1"
 ```
-pip install pysqs-extended-client
+
+Poetry:
+
+```toml
+pysqs-extended-client = {git = "https://github.com/timothymugayi/boto3-sqs-extended-client-lib.git", tag = "v0.2.1"}
 ```
+
+Do not use `pip install pysqs-extended-client` (or pin `==0.2.1` from PyPI) until a new release is uploaded there.
 
 ## Usage
 
@@ -121,6 +131,7 @@ config = ExtendedClientConfiguration(
     use_legacy_attribute=True,
     ignore_payload_not_found=False,
     s3_key_prefix="payloads/",
+    s3_canned_acl=None,  # e.g. "bucket-owner-read"; omit unless Object Ownership allows ACLs
 )
 sqs = SQSClientExtended(
     sqs_client=boto3.client("sqs"),
@@ -132,6 +143,14 @@ sqs = SQSClientExtended(
 `use_legacy_attribute=True` (default, same as Java) writes `SQSLargePayloadSize`. Set it `False` to write `ExtendedPayloadSize`. Receive accepts both.
 
 Configure the client **before** constructing it. After `SQSClientExtended` is created the config is frozen (unlike the Java client, which is documented as not thread-safe). Setters such as `set_always_through_s3` raise `FrozenConfigError` after init.
+
+Inject boto3 clients when you need custom credentials, endpoints, or session configuration. Do not look for a separate `config.py` module.
+
+### Cross-account S3 payloads
+
+Uploads default to the bucket's Object Ownership settings (no canned ACL). Prefer a **bucket policy** that grants the consuming account `s3:GetObject` (and `s3:DeleteObject` if `cleanup_s3_payload` is on).
+
+If you still need a canned ACL, set `s3_canned_acl` (for example `"bucket-owner-read"` or `"bucket-owner-full-control"`). That is passed as `ExtraArgs={"ACL": ...}` on `upload_fileobj`. Buckets with Object Ownership **BucketOwnerEnforced** reject ACLs; leave `s3_canned_acl` unset in that case.
 
 ### Sharing a client across worker threads
 
