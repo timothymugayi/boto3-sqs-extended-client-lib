@@ -261,6 +261,18 @@ def test_offloaded_send_uses_s3_key_prefix():
 	assert mock_s3.put_calls[0]["Key"].startswith("inbox/")
 
 
+def test_offloaded_send_omits_acl_extra_args_by_default():
+	client, _, mock_s3 = _client(always_through_s3=True)
+	client.send_message("https://sqs.example/queue", "hello")
+	assert "ExtraArgs" not in mock_s3.put_calls[0]
+
+
+def test_offloaded_send_passes_s3_canned_acl():
+	client, _, mock_s3 = _client(always_through_s3=True, s3_canned_acl="bucket-owner-read")
+	client.send_message("https://sqs.example/queue", "hello")
+	assert mock_s3.put_calls[0]["ExtraArgs"] == {"ACL": "bucket-owner-read"}
+
+
 def test_delete_skips_s3_when_cleanup_disabled():
 	client, mock_sqs, mock_s3 = _client(cleanup_s3_payload=False)
 	mock_s3.objects[("test-bucket", "abc-key")] = b"payload"

@@ -537,17 +537,26 @@ class SQSClientExtended:
 		params.update(kwargs)
 		return self.sqs.send_message_batch(**params)
 
+	def _s3_extra_args(self):
+		if not self.config.s3_canned_acl:
+			return None
+		return {"ACL": self.config.s3_canned_acl}
+
 	def _store_message_in_s3(self, message_body):
 		s3_key = self.config.s3_key_prefix + str(uuid.uuid4())
 		data = str(message_body).encode("utf-8")
 		started = time.time()
 		try:
-			self.s3.upload_fileobj(
-				BytesIO(data),
-				self.config.s3_bucket_name,
-				s3_key,
-				Config=self._transfer_config(),
-			)
+			upload_kwargs = {
+				"Fileobj": BytesIO(data),
+				"Bucket": self.config.s3_bucket_name,
+				"Key": s3_key,
+				"Config": self._transfer_config(),
+			}
+			extra_args = self._s3_extra_args()
+			if extra_args:
+				upload_kwargs["ExtraArgs"] = extra_args
+			self.s3.upload_fileobj(**upload_kwargs)
 			self._emit(
 				"s3_offload",
 				bytes=len(data),
