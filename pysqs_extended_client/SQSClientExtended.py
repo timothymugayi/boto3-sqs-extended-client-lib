@@ -2,6 +2,7 @@ import base64
 import binascii
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -25,6 +26,7 @@ class SQSExtendedClientConstants(Enum):
 	MAX_ALLOWED_ATTRIBUTES = 10 - 1  # 10 for SQS, 1 for the reserved attribute
 	RESERVED_ATTRIBUTE_NAME = "SQSLargePayloadSize"
 	RESERVED_ATTRIBUTE_NAME_EXTENDED = "ExtendedPayloadSize"
+	CONTENT_TYPE_ATTRIBUTE = "SQSExtendedContentType"  # "text" | "binary" | "binary-b64"
 	PAYLOAD_S3_POINTER_CLASS = "software.amazon.payloadoffloading.PayloadS3Pointer"
 	LEGACY_PAYLOAD_S3_POINTER_CLASS = "com.amazon.sqs.javamessaging.MessageS3Pointer"
 	S3_BUCKET_NAME_MARKER = "-..s3BucketName..-"
@@ -175,11 +177,6 @@ class SQSClientExtended:
 					total_msg_attributes_size += self._get_string_size_in_bytes(entry.get("BinaryValue"))
 		return total_msg_attributes_size
 
-	def _is_large(self, message, message_attributes):
-		msg_attributes_size = self._get_msg_attributes_size(message_attributes)
-		msg_body_size = self._get_string_size_in_bytes(message)
-		return (msg_attributes_size + msg_body_size) > self.config.message_size_threshold
-
 	def _reserved_attribute_name_if_present(self, message_attributes):
 		if not message_attributes:
 			return None
@@ -233,25 +230,117 @@ class SQSClientExtended:
 			raise ValueError(
 				"Message attribute name {} is reserved for use by SQS extended client.".format(reserved_attribute_name)
 			)
+		content_type_name = SQSExtendedClientConstants.CONTENT_TYPE_ATTRIBUTE.value
+		if content_type_name in message_attributes:
+			raise ValueError(
+				"Message attribute name {} is reserved for use by SQS extended client.".format(content_type_name)
+			)
 
-	def _should_offload(self, message, message_attributes):
-		return self.config.always_through_s3 or self._is_large(str(message), message_attributes)
+	def _is_filesystem_path(self, message):
+		# Large bodies are not paths. stat() on them raises "file name too long".
+		if len(message) > 1024 or "\x00" in message or "\n" in message:
+			return False
+		try:
+			return os.path.isfile(message)
+		except (OSError, ValueError):
+			return False
 
-	def _apply_offload_pointer(self, message, message_attributes, pointer):
+	def _normalize_payload(self, message):
+		"""
+		Returns (payload, size_bytes, is_binary, is_streamable).
+		payload is bytes, a filesystem path (str), or an open binary file-like.
+		"""
+		if message is None:
+			raise ValueError("message cannot be None")
+
+		if isinstance(message, (bytes, bytearray)):
+			data = bytes(message)
+			return data, len(data), True, False
+
+		if hasattr(message, "read"):
+			if hasattr(message, "seek") and hasattr(message, "tell"):
+				pos = message.tell()
+				message.seek(0, os.SEEK_END)
+				size = message.tell()
+				message.seek(pos)
+			else:
+				size = self.config.message_size_threshold + 1
+			return message, size, True, True
+
+		if isinstance(message, str) and self._is_filesystem_path(message):
+			return message, os.path.getsize(message), True, True
+
+		if isinstance(message, str):
+			data = message.encode("utf-8")
+			return data, len(data), False, False
+
+		raise TypeError(
+			"message must be str, bytes, file path or file-like object, got %s" % type(message)
+		)
+
+	def _should_offload(self, size_bytes, message_attributes):
+		if self.config.always_through_s3:
+			return True
+		attr_size = self._get_msg_attributes_size(message_attributes)
+		return (attr_size + size_bytes) > self.config.message_size_threshold
+
+	def _ensure_binary_offload_attribute_room(self, message_attributes, is_binary):
+		if not is_binary:
+			return
+		# Offload already reserves one attribute for payload size. Binary adds content type.
+		limit = SQSExtendedClientConstants.MAX_ALLOWED_ATTRIBUTES.value - 1
+		if len(message_attributes) > limit:
+			raise ValueError(
+				"Number of message attributes [{}] exceeds the maximum allowed for binary large-payload messages [{}].".format(
+					len(message_attributes), limit
+				)
+			)
+
+	def _attach_offload_attributes(self, message_attributes, size_bytes, is_binary):
 		message_attributes[self._payload_size_attribute_name()] = {
-			"StringValue": str(self._get_string_size_in_bytes(str(message))),
+			"StringValue": str(size_bytes),
 			"DataType": "Number",
 		}
-		return self._to_payload_s3_pointer_json(pointer), message_attributes
+		if is_binary:
+			message_attributes[SQSExtendedClientConstants.CONTENT_TYPE_ATTRIBUTE.value] = {
+				"StringValue": "binary",
+				"DataType": "String",
+			}
+		return message_attributes
+
+	def _read_small_payload(self, payload, is_streamable):
+		if not is_streamable:
+			return payload
+		if isinstance(payload, str):
+			with open(payload, "rb") as handle:
+				return handle.read()
+		return payload.read()
+
+	def _encode_small_body(self, data, is_binary, message_attributes):
+		if is_binary:
+			body = base64.b64encode(data).decode("ascii")
+			message_attributes[SQSExtendedClientConstants.CONTENT_TYPE_ATTRIBUTE.value] = {
+				"StringValue": "binary-b64",
+				"DataType": "String",
+			}
+			return body, message_attributes
+		return data.decode("utf-8"), message_attributes
+
+	def _require_s3_bucket(self):
+		if not self.config.s3_bucket_name or not str(self.config.s3_bucket_name).strip():
+			raise ValueError("S3 bucket name cannot be null")
 
 	def _maybe_offload(self, message, message_attributes):
 		self._validate_message_attributes(message_attributes)
-		if self._should_offload(message, message_attributes):
-			if not self.config.s3_bucket_name or not str(self.config.s3_bucket_name).strip():
-				raise ValueError("S3 bucket name cannot be null")
-			pointer = self._store_message_in_s3(message)
-			return self._apply_offload_pointer(message, message_attributes, pointer)
-		return message, message_attributes
+		payload, size_bytes, is_binary, is_streamable = self._normalize_payload(message)
+		if self._should_offload(size_bytes, message_attributes):
+			self._ensure_binary_offload_attribute_room(message_attributes, is_binary)
+			self._require_s3_bucket()
+			pointer = self._store_message_in_s3(payload, size_bytes, is_streamable)
+			self._attach_offload_attributes(message_attributes, size_bytes, is_binary)
+			return self._to_payload_s3_pointer_json(pointer), message_attributes
+		data = self._read_small_payload(payload, is_streamable)
+		return self._encode_small_body(data, is_binary, message_attributes)
 
 	def receive_message(self, queue_url, max_number_of_messages=1, wait_time_seconds=10, **kwargs):
 		"""
@@ -264,6 +353,7 @@ class SQSClientExtended:
 			for reserved in (
 				SQSExtendedClientConstants.RESERVED_ATTRIBUTE_NAME.value,
 				SQSExtendedClientConstants.RESERVED_ATTRIBUTE_NAME_EXTENDED.value,
+				SQSExtendedClientConstants.CONTENT_TYPE_ATTRIBUTE.value,
 			):
 				if reserved not in message_attribute_names:
 					message_attribute_names.append(reserved)
@@ -284,8 +374,10 @@ class SQSClientExtended:
 		hydrate_jobs = []
 		for index, message in enumerate(opt_messages):
 			reserved_attribute_name = self._reserved_attribute_name_if_present(message.get("MessageAttributes", {}))
+			content_type = self._content_type_of(message)
 			if not reserved_attribute_name:
-				parsed.append((index, message, None, None, None))
+				self._decode_inline_binary(message, content_type)
+				parsed.append((index, message, None, None, None, content_type))
 				continue
 			try:
 				message_body = self._parse_s3_pointer(message.get("Body"))
@@ -295,15 +387,16 @@ class SQSClientExtended:
 				raise ValueError("Detected missing required key attribute s3BucketName and s3Key in s3 payload")
 			s3_bucket_name = message_body.get("s3BucketName")
 			s3_key = message_body.get("s3Key")
-			parsed.append((index, message, reserved_attribute_name, s3_bucket_name, s3_key))
-			hydrate_jobs.append((index, s3_bucket_name, s3_key))
+			as_binary = content_type in ("binary", "binary-b64")
+			parsed.append((index, message, reserved_attribute_name, s3_bucket_name, s3_key, content_type))
+			hydrate_jobs.append((index, s3_bucket_name, s3_key, as_binary))
 
 		bodies = {}
 		errors = {}
 		if hydrate_jobs:
 			future_to_index = {
-				self._executor().submit(self._hydrate_from_s3, bucket, key): index
-				for index, bucket, key in hydrate_jobs
+				self._executor().submit(self._hydrate_from_s3, bucket, key, as_binary): index
+				for index, bucket, key, as_binary in hydrate_jobs
 			}
 			for future in as_completed(future_to_index):
 				index = future_to_index[future]
@@ -313,7 +406,7 @@ class SQSClientExtended:
 					errors[index] = exc
 
 		hydrated = []
-		for index, message, reserved_attribute_name, s3_bucket_name, s3_key in parsed:
+		for index, message, reserved_attribute_name, s3_bucket_name, s3_key, content_type in parsed:
 			if reserved_attribute_name is None:
 				hydrated.append(message)
 				continue
@@ -331,8 +424,13 @@ class SQSClientExtended:
 					logger.warning("Message deleted from SQS since payload with pointer could not be found in S3.")
 					continue
 				raise ValueError("S3 payload was not found for key {}".format(s3_key))
+			if content_type == "binary-b64":
+				orig_msg_body = base64.b64decode(orig_msg_body)
 			message["Body"] = orig_msg_body
+			if content_type in ("binary", "binary-b64"):
+				message["_is_binary"] = True
 			message.get("MessageAttributes").pop(reserved_attribute_name)
+			message.get("MessageAttributes").pop(SQSExtendedClientConstants.CONTENT_TYPE_ATTRIBUTE.value, None)
 			message["ReceiptHandle"] = (
 				SQSExtendedClientConstants.S3_BUCKET_NAME_MARKER.value
 				+ s3_bucket_name
@@ -345,8 +443,27 @@ class SQSClientExtended:
 			hydrated.append(message)
 		return hydrated
 
-	def _hydrate_from_s3(self, s3_bucket_name, s3_key):
-		return self.get_text_from_s3(s3_bucket_name, s3_key)
+	def _content_type_of(self, message):
+		attrs = message.get("MessageAttributes") or {}
+		entry = attrs.get(SQSExtendedClientConstants.CONTENT_TYPE_ATTRIBUTE.value) or {}
+		if isinstance(entry, dict):
+			return entry.get("StringValue") or "text"
+		return "text"
+
+	def _decode_inline_binary(self, message, content_type):
+		if content_type != "binary-b64":
+			return
+		body = message.get("Body")
+		if isinstance(body, str):
+			body = body.encode("ascii")
+		message["Body"] = base64.b64decode(body)
+		message["_is_binary"] = True
+		attrs = message.get("MessageAttributes")
+		if attrs:
+			attrs.pop(SQSExtendedClientConstants.CONTENT_TYPE_ATTRIBUTE.value, None)
+
+	def _hydrate_from_s3(self, s3_bucket_name, s3_key, as_binary=False):
+		return self.get_payload_from_s3(s3_bucket_name, s3_key, as_binary=as_binary)
 
 	def _is_missing_s3_object(self, exc):
 		return exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404")
@@ -495,41 +612,45 @@ class SQSClientExtended:
 			if body is None:
 				raise ValueError("message_body required")
 			attrs = dict(entry.get("MessageAttributes") or {})
+			payload, size_bytes, is_binary, is_streamable = self._normalize_payload(body)
 			self._validate_message_attributes(attrs)
-			if self._should_offload(body, attrs):
-				if not self.config.s3_bucket_name or not str(self.config.s3_bucket_name).strip():
-					raise ValueError("S3 bucket name cannot be null")
-				offload_jobs.append((index, body, attrs))
-			entry["_attrs"] = attrs
-			entry["_body"] = body
+			if self._should_offload(size_bytes, attrs):
+				self._ensure_binary_offload_attribute_room(attrs, is_binary)
+				self._require_s3_bucket()
+				offload_jobs.append((index, payload, size_bytes, is_streamable, is_binary, attrs))
+			else:
+				data = self._read_small_payload(payload, is_streamable)
+				inline, attrs = self._encode_small_body(data, is_binary, attrs)
+				entry["MessageBody"] = inline
+				entry["_attrs"] = attrs
 			prepared.append(entry)
 
 		if offload_jobs:
 			future_to_index = {
-				self._executor().submit(self._store_message_in_s3, body): (index, body, attrs)
-				for index, body, attrs in offload_jobs
+				self._executor().submit(self._store_message_in_s3, payload, size_bytes, is_streamable): (
+					index, size_bytes, is_binary, attrs
+				)
+				for index, payload, size_bytes, is_streamable, is_binary, attrs in offload_jobs
 			}
 			results = {}
 			first_error = None
 			for future in as_completed(future_to_index):
-				index, body, attrs = future_to_index[future]
+				index, size_bytes, is_binary, attrs = future_to_index[future]
 				try:
-					results[index] = (future.result(), body, attrs)
+					results[index] = (future.result(), size_bytes, is_binary, attrs)
 				except Exception as exc:
 					if first_error is None:
 						first_error = exc
 			if first_error is not None:
 				raise first_error
-			for index, (pointer, body, attrs) in results.items():
-				offloaded, attrs = self._apply_offload_pointer(body, attrs, pointer)
-				prepared[index]["MessageBody"] = offloaded
+			for index, (pointer, size_bytes, is_binary, attrs) in results.items():
+				self._attach_offload_attributes(attrs, size_bytes, is_binary)
+				prepared[index]["MessageBody"] = self._to_payload_s3_pointer_json(pointer)
 				prepared[index]["_attrs"] = attrs
 
 		sqs_entries = []
 		for entry in prepared:
 			attrs = entry.pop("_attrs")
-			original_body = entry.pop("_body")
-			entry.setdefault("MessageBody", original_body)
 			if attrs:
 				entry["MessageAttributes"] = attrs
 			sqs_entries.append(entry)
@@ -542,24 +663,36 @@ class SQSClientExtended:
 			return None
 		return {"ACL": self.config.s3_canned_acl}
 
-	def _store_message_in_s3(self, message_body):
+	def _store_message_in_s3(self, payload, size_bytes, is_streamable):
 		s3_key = self.config.s3_key_prefix + str(uuid.uuid4())
-		data = str(message_body).encode("utf-8")
 		started = time.time()
+		extra_args = self._s3_extra_args()
+		transfer_cfg = self._transfer_config()
 		try:
-			upload_kwargs = {
-				"Fileobj": BytesIO(data),
-				"Bucket": self.config.s3_bucket_name,
-				"Key": s3_key,
-				"Config": self._transfer_config(),
-			}
-			extra_args = self._s3_extra_args()
-			if extra_args:
-				upload_kwargs["ExtraArgs"] = extra_args
-			self.s3.upload_fileobj(**upload_kwargs)
+			if is_streamable and isinstance(payload, str):
+				kwargs = {
+					"Filename": payload,
+					"Bucket": self.config.s3_bucket_name,
+					"Key": s3_key,
+					"Config": transfer_cfg,
+				}
+				if extra_args:
+					kwargs["ExtraArgs"] = extra_args
+				self.s3.upload_file(**kwargs)
+			else:
+				fileobj = payload if is_streamable else BytesIO(payload)
+				kwargs = {
+					"Fileobj": fileobj,
+					"Bucket": self.config.s3_bucket_name,
+					"Key": s3_key,
+					"Config": transfer_cfg,
+				}
+				if extra_args:
+					kwargs["ExtraArgs"] = extra_args
+				self.s3.upload_fileobj(**kwargs)
 			self._emit(
 				"s3_offload",
-				bytes=len(data),
+				bytes=size_bytes,
 				s3_key=s3_key,
 				duration_ms=int((time.time() - started) * 1000),
 			)
@@ -570,7 +703,7 @@ class SQSClientExtended:
 			)
 			raise
 
-	def get_text_from_s3(self, s3_bucket_name, s3_key):
+	def get_payload_from_s3(self, s3_bucket_name, s3_key, as_binary=False):
 		started = time.time()
 		buffer = BytesIO()
 		self.s3.download_fileobj(
@@ -587,6 +720,11 @@ class SQSClientExtended:
 			s3_key=s3_key,
 			duration_ms=int((time.time() - started) * 1000),
 		)
+		if as_binary:
+			return body
 		if isinstance(body, bytes):
 			return body.decode("utf-8")
 		return body
+
+	def get_text_from_s3(self, s3_bucket_name, s3_key):
+		return self.get_payload_from_s3(s3_bucket_name, s3_key, as_binary=False)
