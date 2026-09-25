@@ -87,7 +87,9 @@ sqs.send_message(
 
 ### Large payloads and files
 
-The public send API is a **string** (`send_message(queue_url, message)`). If the UTF-8 size of the body (plus attributes) is over 256 KB, or you set `always_through_s3=True`, the library uploads the payload to S3 (multipart above ~8 MB) and puts a Java `PayloadS3Pointer` on the queue. Receive hydrates the original string.
+`send_message(queue_url, message)` still accepts a string. A string that is not an existing file path is text: small messages stay in SQS, and messages over 256 KB (or `always_through_s3=True`) are stored in S3 as UTF-8. Receive of those messages, including ones sent by older versions of this library, returns a `str`. The Java `PayloadS3Pointer` format is unchanged.
+
+You can also pass `bytes`, an existing file path, or a binary file-like object. Paths and file objects are uploaded with `upload_file` / `upload_fileobj` (multipart above ~8 MB) and are not loaded into memory when they go to S3. Receive returns `bytes` for those payloads. Messages without `SQSExtendedContentType` stay text.
 
 ```python
 from pysqs_extended_client import SQSClientExtended, ExtendedClientConfiguration
@@ -104,19 +106,19 @@ sqs = SQSClientExtended(
     ),
 )
 
-with open("large-report.json", "r", encoding="utf-8") as handle:
-    payload = handle.read()
-
-sqs.send_message(queue_url, payload)
+sqs.send_message(queue_url, "small body")
+sqs.send_message(queue_url, b"\x00\x01\x02")
+sqs.send_message(queue_url, "/path/to/large-video.mp4")
+with open("huge.zip", "rb") as handle:
+    sqs.send_message(queue_url, handle)
 
 messages = sqs.receive_message(queue_url, wait_time_seconds=10)
 for message in messages or []:
-    with open("received-report.json", "w", encoding="utf-8") as handle:
-        handle.write(message["Body"])
+    body = message["Body"]  # str for text, bytes for binary
     sqs.delete_message(queue_url, message["ReceiptHandle"])
 ```
 
-SQS still has a 256 KB **message** limit; only the payload bytes go to S3. Binary files are not a first-class `fileobj` API — encode them first (for example `base64.b64encode(data).decode("ascii")`) and decode after receive. The hydrated body is held in memory, same as the Java client.
+SQS still has a 256 KB **message** limit; only the payload bytes go to S3. Receive still loads the payload into memory, same as the Java client.
 
 ### Configuration and injected clients
 
@@ -158,7 +160,7 @@ Create **one** `SQSClientExtended` per process and share it across Celery / guni
 
 Set `max_pool_connections` at least as high as your worker thread count (default 50). `s3_max_concurrency` (default 10) bounds parallel S3 uploads, hydrates, and deletes on batch/receive. Built clients use connect/read timeouts (3s / 60s) and standard retries. Injected `sqs_client` / `s3_client` are not wrapped.
 
-Large S3 bodies use multipart upload via boto3 `TransferConfig` (8 MB threshold). The public send API is still a string; the Java pointer format is unchanged.
+Large S3 bodies use multipart upload via boto3 `TransferConfig` (8 MB threshold). Text messages keep the Java pointer format. File paths and binary file objects stream through that same transfer config.
 
 If a batch `send_message_batch` S3 offload fails, the whole batch is not sent.
 
@@ -191,7 +193,23 @@ The compose file pins `localstack/localstack:4.14.0` so it starts **without an a
 docker compose up -d
 ```
 
-Point the library at LocalStack with `endpoint_url` (dummy credentials are enough):
+Wait until `http://127.0.0.1:4566/_localstack/health` responds, then run either the pytest marker or the smoke script. Both talk to `http://127.0.0.1:4566` with dummy credentials. They are skipped or fail if LocalStack is not up.
+
+```bash
+pytest -m localstack
+python scripts/localstack_smoke.py
+docker compose down
+```
+
+`pytest -m localstack` runs `tests/test_localstack.py`. `scripts/localstack_smoke.py` is the same checks as a standalone script. Each one checks:
+
+* a small string stays in SQS and comes back as `str`
+* a large string is stored in S3 and still comes back as `str`
+* small `bytes` come back as `bytes`
+* a file path and a binary file object come back as `bytes`
+* a 16 KiB payload with `multipart_threshold=1024` calls S3 `CreateMultipartUpload` and round-trips
+
+Point your own code at the same endpoint:
 
 ```python
 from pysqs_extended_client import SQSClientExtended, ExtendedClientConfiguration
@@ -209,12 +227,7 @@ queue_url = sqs.get_queue_url(QueueName="sqs-extended-demo")["QueueUrl"]
 sqs.send_message(queue_url, "hello from localstack")
 ```
 
-You can also inject boto3 clients created with `endpoint_url="http://127.0.0.1:4566"`. Injected clients are not wrapped.
-
-```bash
-pytest -m localstack          # skipped unless LocalStack is up
-docker compose down
-```
+You can also inject boto3 clients created with `endpoint_url="http://127.0.0.1:4566"`. Injected clients are not wrapped. The default multipart threshold is 8 MB. Lower `multipart_threshold` on `ExtendedClientConfiguration` when you want a small local file to take the multipart path.
 
 ## Feedback
 

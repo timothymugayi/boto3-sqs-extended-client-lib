@@ -41,8 +41,16 @@ class FakeS3:
 			self.objects[(kwargs["Bucket"], kwargs["Key"])] = body
 		return {}
 
+	def upload_file(self, Filename, Bucket, Key, ExtraArgs=None, Callback=None, Config=None):
+		with open(Filename, "rb") as handle:
+			body = handle.read()
+		kwargs = {"Bucket": Bucket, "Key": Key, "Body": body, "UploadMethod": "upload_file"}
+		if ExtraArgs:
+			kwargs["ExtraArgs"] = ExtraArgs
+		return self.put_object(**kwargs)
+
 	def upload_fileobj(self, Fileobj, Bucket, Key, ExtraArgs=None, Callback=None, Config=None):
-		kwargs = {"Bucket": Bucket, "Key": Key, "Body": Fileobj.read()}
+		kwargs = {"Bucket": Bucket, "Key": Key, "Body": Fileobj.read(), "UploadMethod": "upload_fileobj"}
 		if ExtraArgs:
 			kwargs["ExtraArgs"] = ExtraArgs
 		return self.put_object(**kwargs)

@@ -319,6 +319,7 @@ def test_receive_forwards_visibility_timeout_and_reserved_attribute_names():
 	assert "CustomAttr" in call["MessageAttributeNames"]
 	assert "SQSLargePayloadSize" in call["MessageAttributeNames"]
 	assert "ExtendedPayloadSize" in call["MessageAttributeNames"]
+	assert "SQSExtendedContentType" in call["MessageAttributeNames"]
 
 
 def test_send_message_does_not_reuse_mutable_default_attributes():
