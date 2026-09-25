@@ -4,7 +4,7 @@ Boto3 SQS Extended Client Library for Python
 [![Tests](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/actions/workflows/tests.yml)
 [![codecov](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib/branch/master/graph/badge.svg)](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib)
 
-The **Amazon SQS Extended Client Library for Python** (version **0.2.1**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit, up to 2 GB) and puts a pointer on the queue.
+The **Amazon SQS Extended Client Library for Python** (version **0.3.0**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit, up to 2 GB) and puts a pointer on the queue.
 
 You can:
 
@@ -26,16 +26,16 @@ You can:
 PyPI still publishes **0.0.1** only. Until that project can be updated, install from GitHub:
 
 ```bash
-pip install "pysqs-extended-client @ git+https://github.com/timothymugayi/boto3-sqs-extended-client-lib.git@v0.2.1"
+pip install "pysqs-extended-client @ git+https://github.com/timothymugayi/boto3-sqs-extended-client-lib.git@v0.3.0"
 ```
 
 Poetry:
 
 ```toml
-pysqs-extended-client = {git = "https://github.com/timothymugayi/boto3-sqs-extended-client-lib.git", tag = "v0.2.1"}
+pysqs-extended-client = {git = "https://github.com/timothymugayi/boto3-sqs-extended-client-lib.git", tag = "v0.3.0"}
 ```
 
-Do not use `pip install pysqs-extended-client` (or pin `==0.2.1` from PyPI) until a new release is uploaded there.
+Do not use `pip install pysqs-extended-client` (or pin `==0.3.0` from PyPI) until a new release is uploaded there.
 
 ## Usage
 

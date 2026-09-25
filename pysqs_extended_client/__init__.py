@@ -2,7 +2,7 @@ from pysqs_extended_client.SQSClientExtended import SQSClientExtended, SQSExtend
 from pysqs_extended_client.extended_config import ExtendedClientConfiguration, FrozenConfigError
 
 __title__ = "pysqs_client_extended"
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
 	"SQSClientExtended",
