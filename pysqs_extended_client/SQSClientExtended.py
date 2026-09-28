@@ -1,8 +1,8 @@
 import base64
-import binascii
 import json
 import logging
 import os
+import pathlib
 import threading
 import time
 import uuid
@@ -55,31 +55,36 @@ class SQSClientExtended:
 		sqs_client=None,
 		s3_client=None,
 	):
-		self.aws_access_key_id = aws_access_key_id
-		self.aws_secret_access_key = aws_secret_access_key
-		self.aws_region_name = aws_region_name
 		if config is None:
 			self.config = ExtendedClientConfiguration(s3_bucket_name=s3_bucket_name)
 		else:
 			self.config = config
 			if s3_bucket_name and not self.config.s3_bucket_name:
 				self.config.s3_bucket_name = s3_bucket_name
-		self.sqs = sqs_client if sqs_client is not None else self._build_client("sqs")
-		self.s3 = s3_client if s3_client is not None else self._build_client("s3")
+		# Keys are passed only into boto3 and are not retained on this instance.
+		# Omit them to use the default credential chain (env, shared file, role).
+		self.sqs = sqs_client if sqs_client is not None else self._build_client(
+			"sqs", aws_access_key_id, aws_secret_access_key, aws_region_name
+		)
+		self.s3 = s3_client if s3_client is not None else self._build_client(
+			"s3", aws_access_key_id, aws_secret_access_key, aws_region_name
+		)
 		self._pool = None
 		self._pool_lock = threading.Lock()
 		self.config.freeze()
 
-	def _build_client(self, service_name):
+	def _build_client(self, service_name, aws_access_key_id, aws_secret_access_key, aws_region_name):
 		kwargs = {"config": self._botocore_config()}
 		if self.config.endpoint_url:
 			kwargs["endpoint_url"] = self.config.endpoint_url
-		if self.aws_access_key_id and self.aws_secret_access_key and self.aws_region_name:
+		if aws_access_key_id and aws_secret_access_key and aws_region_name:
 			kwargs.update(
-				aws_access_key_id=self.aws_access_key_id,
-				aws_secret_access_key=self.aws_secret_access_key,
-				region_name=self.aws_region_name,
+				aws_access_key_id=aws_access_key_id,
+				aws_secret_access_key=aws_secret_access_key,
+				region_name=aws_region_name,
 			)
+		elif aws_region_name and not (aws_access_key_id or aws_secret_access_key):
+			kwargs["region_name"] = aws_region_name
 		return boto3.client(service_name, **kwargs)
 
 	def _botocore_config(self):
@@ -135,32 +140,28 @@ class SQSClientExtended:
 		return self.config.message_size_threshold
 
 	def is_large_payload_support_enabled(self):
-		return True
+		"""Java ``isPayloadSupportEnabled`` / deprecated ``isLargePayloadSupportEnabled``.
 
-	def set_always_through_s3(self, always_through_s3):
-		self.config.always_through_s3 = always_through_s3
-
-	def set_message_size_threshold(self, message_size_threshold):
-		self.config.message_size_threshold = message_size_threshold
+		True unless ``ExtendedClientConfiguration(payload_support_enabled=False)``
+		was set before this client was created. There is no setter after init.
+		"""
+		return bool(self.config.payload_support_enabled)
 
 	def __getattr__(self, name):
 		return getattr(self.sqs, name)
 
-	def _get_string_size_in_bytes(self, message_body):
-		return len(message_body.encode("utf-8"))
+	def _get_string_size_in_bytes(self, value):
+		if isinstance(value, (bytes, bytearray)):
+			return len(value)
+		return len(value.encode("utf-8"))
 
-	def _string_to_base64(self, s):
-		return base64.b64encode(s.encode("utf-8"))
-
-	def _base64_to_string(self, b):
-		return base64.b64decode(b).decode("utf-8")
-
-	def _is_base64(self, value):
-		try:
-			encoded = self._string_to_base64(self._base64_to_string(value))
-			return encoded == value.encode("utf-8")
-		except (TypeError, ValueError, UnicodeError, binascii.Error, AttributeError):
-			return False
+	def _binary_attribute_size(self, value):
+		# boto3 BinaryValue is bytes. SQS counts the raw byte length, not a base64 wire size.
+		if isinstance(value, (bytes, bytearray, memoryview)):
+			return len(value)
+		if isinstance(value, str):
+			return len(value.encode("utf-8"))
+		raise TypeError("BinaryValue must be bytes or str, got %s" % type(value).__name__)
 
 	def _get_msg_attributes_size(self, message_attributes):
 		total_msg_attributes_size = 0
@@ -170,11 +171,9 @@ class SQSClientExtended:
 				total_msg_attributes_size += self._get_string_size_in_bytes(entry.get("DataType"))
 			if entry.get("StringValue"):
 				total_msg_attributes_size += self._get_string_size_in_bytes(entry.get("StringValue"))
-			if entry.get("BinaryValue"):
-				if self._is_base64(entry.get("BinaryValue")):
-					total_msg_attributes_size += len(entry.get("BinaryValue").encode("utf-8"))
-				else:
-					total_msg_attributes_size += self._get_string_size_in_bytes(entry.get("BinaryValue"))
+			binary_value = entry.get("BinaryValue")
+			if binary_value is not None and binary_value != "":
+				total_msg_attributes_size += self._binary_attribute_size(binary_value)
 		return total_msg_attributes_size
 
 	def _reserved_attribute_name_if_present(self, message_attributes):
@@ -236,19 +235,13 @@ class SQSClientExtended:
 				"Message attribute name {} is reserved for use by SQS extended client.".format(content_type_name)
 			)
 
-	def _is_filesystem_path(self, message):
-		# Large bodies are not paths. stat() on them raises "file name too long".
-		if len(message) > 1024 or "\x00" in message or "\n" in message:
-			return False
-		try:
-			return os.path.isfile(message)
-		except (OSError, ValueError):
-			return False
-
 	def _normalize_payload(self, message):
 		"""
 		Returns (payload, size_bytes, is_binary, is_streamable).
 		payload is bytes, a filesystem path (str), or an open binary file-like.
+
+		A plain str is always text, even when that string is an existing filesystem
+		path. Pass pathlib.Path / os.PathLike or call send_file() to upload a file.
 		"""
 		if message is None:
 			raise ValueError("message cannot be None")
@@ -256,6 +249,12 @@ class SQSClientExtended:
 		if isinstance(message, (bytes, bytearray)):
 			data = bytes(message)
 			return data, len(data), True, False
+
+		if isinstance(message, os.PathLike):
+			path = os.fspath(message)
+			if not os.path.isfile(path):
+				raise ValueError("file path does not exist or is not a file: {}".format(path))
+			return path, os.path.getsize(path), True, True
 
 		if hasattr(message, "read"):
 			if hasattr(message, "seek") and hasattr(message, "tell"):
@@ -267,15 +266,13 @@ class SQSClientExtended:
 				size = self.config.message_size_threshold + 1
 			return message, size, True, True
 
-		if isinstance(message, str) and self._is_filesystem_path(message):
-			return message, os.path.getsize(message), True, True
-
 		if isinstance(message, str):
 			data = message.encode("utf-8")
 			return data, len(data), False, False
 
 		raise TypeError(
-			"message must be str, bytes, file path or file-like object, got %s" % type(message)
+			"message must be str, bytes, pathlib.Path, or a binary file-like object, got %s. "
+			"To send a file, pass a pathlib.Path or call send_file()." % type(message).__name__
 		)
 
 	def _should_offload(self, size_bytes, message_attributes):
@@ -331,6 +328,12 @@ class SQSClientExtended:
 			raise ValueError("S3 bucket name cannot be null")
 
 	def _maybe_offload(self, message, message_attributes):
+		if not self.config.payload_support_enabled:
+			if not isinstance(message, str):
+				raise TypeError(
+					"payload support is disabled; message must be str, got %s" % type(message).__name__
+				)
+			return message, message_attributes
 		self._validate_message_attributes(message_attributes)
 		payload, size_bytes, is_binary, is_streamable = self._normalize_payload(message)
 		if self._should_offload(size_bytes, message_attributes):
@@ -342,9 +345,17 @@ class SQSClientExtended:
 		data = self._read_small_payload(payload, is_streamable)
 		return self._encode_small_body(data, is_binary, message_attributes)
 
-	def receive_message(self, queue_url, max_number_of_messages=1, wait_time_seconds=10, **kwargs):
+	def receive_message(self, queue_url, max_number_of_messages=1, wait_time_seconds=10, payload_dir=None, **kwargs):
 		"""
 		Retrieves one or more messages (up to 10) and hydrates S3 payloads in parallel.
+
+		Returns a list of messages. An empty queue returns ``[]``.
+
+		By default each S3 payload is loaded fully into memory (``message["Body"]`` is
+		``str`` or ``bytes``). Pass ``payload_dir`` to stream S3 objects to files with
+		``download_file`` instead. Those messages set ``Body`` and ``_payload_path`` to
+		the file path. Inline messages are unchanged. Use ``payload_dir`` for
+		multi-hundred-MB bodies; the in-memory path is the Java-compatible default.
 		"""
 		if "max_number_Of_Messages" in kwargs:
 			max_number_of_messages = kwargs.pop("max_number_Of_Messages")
@@ -366,9 +377,11 @@ class SQSClientExtended:
 		}
 		params.update(kwargs)
 		response_opt_queue = self.sqs.receive_message(**params)
-		opt_messages = response_opt_queue.get("Messages", [])
+		opt_messages = response_opt_queue.get("Messages") or []
 		if not opt_messages:
-			return None
+			return []
+		if not self.config.payload_support_enabled:
+			return list(opt_messages)
 
 		parsed = []
 		hydrate_jobs = []
@@ -377,7 +390,7 @@ class SQSClientExtended:
 			content_type = self._content_type_of(message)
 			if not reserved_attribute_name:
 				self._decode_inline_binary(message, content_type)
-				parsed.append((index, message, None, None, None, content_type))
+				parsed.append((index, message, None, None, None, content_type, None))
 				continue
 			try:
 				message_body = self._parse_s3_pointer(message.get("Body"))
@@ -388,15 +401,16 @@ class SQSClientExtended:
 			s3_bucket_name = message_body.get("s3BucketName")
 			s3_key = message_body.get("s3Key")
 			as_binary = content_type in ("binary", "binary-b64")
-			parsed.append((index, message, reserved_attribute_name, s3_bucket_name, s3_key, content_type))
-			hydrate_jobs.append((index, s3_bucket_name, s3_key, as_binary))
+			filename = self._payload_download_path(payload_dir, s3_key) if payload_dir else None
+			parsed.append((index, message, reserved_attribute_name, s3_bucket_name, s3_key, content_type, filename))
+			hydrate_jobs.append((index, s3_bucket_name, s3_key, as_binary, filename))
 
 		bodies = {}
 		errors = {}
 		if hydrate_jobs:
 			future_to_index = {
-				self._executor().submit(self._hydrate_from_s3, bucket, key, as_binary): index
-				for index, bucket, key, as_binary in hydrate_jobs
+				self._executor().submit(self._hydrate_from_s3, bucket, key, as_binary, filename): index
+				for index, bucket, key, as_binary, filename in hydrate_jobs
 			}
 			for future in as_completed(future_to_index):
 				index = future_to_index[future]
@@ -406,7 +420,7 @@ class SQSClientExtended:
 					errors[index] = exc
 
 		hydrated = []
-		for index, message, reserved_attribute_name, s3_bucket_name, s3_key, content_type in parsed:
+		for index, message, reserved_attribute_name, s3_bucket_name, s3_key, content_type, filename in parsed:
 			if reserved_attribute_name is None:
 				hydrated.append(message)
 				continue
@@ -424,9 +438,13 @@ class SQSClientExtended:
 					logger.warning("Message deleted from SQS since payload with pointer could not be found in S3.")
 					continue
 				raise ValueError("S3 payload was not found for key {}".format(s3_key))
-			if content_type == "binary-b64":
-				orig_msg_body = base64.b64decode(orig_msg_body)
-			message["Body"] = orig_msg_body
+			if filename:
+				message["Body"] = orig_msg_body
+				message["_payload_path"] = orig_msg_body
+			else:
+				if content_type == "binary-b64":
+					orig_msg_body = base64.b64decode(orig_msg_body)
+				message["Body"] = orig_msg_body
 			if content_type in ("binary", "binary-b64"):
 				message["_is_binary"] = True
 			message.get("MessageAttributes").pop(reserved_attribute_name)
@@ -462,21 +480,32 @@ class SQSClientExtended:
 		if attrs:
 			attrs.pop(SQSExtendedClientConstants.CONTENT_TYPE_ATTRIBUTE.value, None)
 
-	def _hydrate_from_s3(self, s3_bucket_name, s3_key, as_binary=False):
-		return self.get_payload_from_s3(s3_bucket_name, s3_key, as_binary=as_binary)
+	def _payload_download_path(self, payload_dir, s3_key):
+		base = os.path.basename(str(s3_key)) or "payload"
+		base = base.replace("..", "_")
+		return os.path.join(payload_dir, "{}-{}".format(uuid.uuid4().hex, base))
+
+	def _hydrate_from_s3(self, s3_bucket_name, s3_key, as_binary=False, filename=None):
+		return self.get_payload_from_s3(
+			s3_bucket_name, s3_key, as_binary=as_binary, filename=filename
+		)
 
 	def _is_missing_s3_object(self, exc):
 		return exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404")
 
-	def _delete_message_payload_from_s3(self, receipt_handle):
-		if not self.config.cleanup_s3_payload:
-			return
-		s3_msg_bucket_name = self._get_bucket_marker_from_receipt_handle(
+	def _s3_target_from_receipt_handle(self, receipt_handle):
+		bucket = self._get_bucket_marker_from_receipt_handle(
 			receipt_handle, SQSExtendedClientConstants.S3_BUCKET_NAME_MARKER.value
 		)
-		s3_msg_key = self._get_bucket_marker_from_receipt_handle(
+		key = self._get_bucket_marker_from_receipt_handle(
 			receipt_handle, SQSExtendedClientConstants.S3_KEY_MARKER.value
 		)
+		return bucket, key
+
+	def _delete_message_payload_from_s3(self, receipt_handle, best_effort=False):
+		if not self.config.cleanup_s3_payload:
+			return
+		s3_msg_bucket_name, s3_msg_key = self._s3_target_from_receipt_handle(receipt_handle)
 		started = time.time()
 		try:
 			self.s3.delete_object(Bucket=s3_msg_bucket_name, Key=s3_msg_key)
@@ -487,8 +516,45 @@ class SQSClientExtended:
 			)
 			logger.info("Deleted s3 object s3://%s/%s", s3_msg_bucket_name, s3_msg_key)
 		except Exception:
+			if best_effort:
+				logger.warning(
+					"Failed to delete S3 payload s3://%s/%s after the SQS message was deleted. "
+					"The object is orphaned until a lifecycle rule or a later cleanup removes it.",
+					s3_msg_bucket_name,
+					s3_msg_key,
+					exc_info=True,
+				)
+				return
 			logger.exception("Failed to delete the message content in S3 object.")
 			raise
+
+	def _best_effort_delete_pointer(self, body):
+		"""Delete an uploaded payload when SQS never accepted the message."""
+		try:
+			parsed = self._parse_s3_pointer(body)
+		except (ValueError, TypeError):
+			return
+		if not isinstance(parsed, dict):
+			return
+		bucket = parsed.get("s3BucketName")
+		key = parsed.get("s3Key")
+		if not bucket or not key:
+			return
+		try:
+			self.s3.delete_object(Bucket=bucket, Key=key)
+			logger.warning(
+				"Deleted S3 payload s3://%s/%s because the SQS send did not complete.",
+				bucket,
+				key,
+			)
+		except Exception:
+			logger.warning(
+				"SQS send did not complete and S3 payload s3://%s/%s could not be deleted. "
+				"The object is orphaned. Configure an S3 lifecycle rule on the payload prefix.",
+				bucket,
+				key,
+				exc_info=True,
+			)
 
 	def _get_bucket_marker_from_receipt_handle(self, receipt_handle, marker):
 		start_marker = receipt_handle.index(marker) + len(marker)
@@ -510,31 +576,96 @@ class SQSClientExtended:
 		)
 
 	def delete_message(self, queue_url, receipt_handle, **kwargs):
-		if self._is_s3_receipt_handle(receipt_handle):
-			self._delete_message_payload_from_s3(receipt_handle)
-			receipt_handle = self._get_orig_receipt_handle(receipt_handle)
-		logger.debug("receipt_handle=%s", receipt_handle)
-		params = {"QueueUrl": queue_url, "ReceiptHandle": receipt_handle}
+		"""Delete an SQS message and, when configured, its S3 payload.
+
+		Default order is SQS first, then best-effort S3 cleanup. If SQS delete
+		fails, the S3 object is left in place so the message can be retried.
+		If S3 cleanup fails afterward, the SQS delete still stands and the object
+		is orphaned (use a lifecycle rule).
+
+		``delete_s3_before_sqs=True`` matches the Java extended client: S3 is
+		removed first. If the following SQS delete fails, the message remains and
+		points at a missing object (a dead pointer). Receipt-handle markers stay
+		compatible with Java either way.
+		"""
+		s3_handle = None
+		sqs_handle = receipt_handle
+		if self.config.payload_support_enabled and self._is_s3_receipt_handle(receipt_handle):
+			s3_handle = receipt_handle
+			sqs_handle = self._get_orig_receipt_handle(receipt_handle)
+		logger.debug("receipt_handle=%s", sqs_handle)
+		params = {"QueueUrl": queue_url, "ReceiptHandle": sqs_handle}
 		params.update(kwargs)
-		return self.sqs.delete_message(**params)
+		if s3_handle and self.config.delete_s3_before_sqs:
+			removed_s3 = bool(self.config.cleanup_s3_payload)
+			self._delete_message_payload_from_s3(s3_handle, best_effort=False)
+			try:
+				return self.sqs.delete_message(**params)
+			except Exception:
+				if removed_s3:
+					bucket, key = self._s3_target_from_receipt_handle(s3_handle)
+					logger.error(
+						"SQS delete failed after the S3 payload was removed. "
+						"The message now points at a missing object (dead pointer) s3://%s/%s. "
+						"This is the Java extended-client order (delete_s3_before_sqs=True). "
+						"The default order deletes SQS first.",
+						bucket,
+						key,
+					)
+				raise
+		result = self.sqs.delete_message(**params)
+		if s3_handle:
+			self._delete_message_payload_from_s3(s3_handle, best_effort=True)
+		return result
 
 	def delete_message_batch(self, queue_url, entries, **kwargs):
 		prepared = []
-		delete_handles = []
+		s3_handles = []
 		for entry in entries:
 			entry = dict(entry)
 			handle = entry.get("ReceiptHandle")
-			if self._is_s3_receipt_handle(handle):
-				delete_handles.append(handle)
+			if self.config.payload_support_enabled and self._is_s3_receipt_handle(handle):
+				s3_handles.append((entry.get("Id"), handle))
 				entry["ReceiptHandle"] = self._get_orig_receipt_handle(handle)
 			prepared.append(entry)
-		if delete_handles:
-			futures = [self._executor().submit(self._delete_message_payload_from_s3, handle) for handle in delete_handles]
+		removed_s3 = bool(s3_handles and self.config.delete_s3_before_sqs and self.config.cleanup_s3_payload)
+		if s3_handles and self.config.delete_s3_before_sqs:
+			futures = [
+				self._executor().submit(self._delete_message_payload_from_s3, handle, False)
+				for _, handle in s3_handles
+			]
 			for future in as_completed(futures):
 				future.result()
 		params = {"QueueUrl": queue_url, "Entries": prepared}
 		params.update(kwargs)
-		return self.sqs.delete_message_batch(**params)
+		try:
+			result = self.sqs.delete_message_batch(**params)
+		except Exception:
+			if removed_s3:
+				logger.error(
+					"SQS DeleteMessageBatch failed after S3 payloads were removed. "
+					"Those messages now point at missing objects (dead pointers)."
+				)
+			raise
+		if s3_handles and not self.config.delete_s3_before_sqs:
+			failed_ids = {item.get("Id") for item in (result or {}).get("Failed") or []}
+			successful = (result or {}).get("Successful")
+			successful_ids = None if successful is None else {item.get("Id") for item in successful}
+			pending = []
+			for entry_id, handle in s3_handles:
+				if entry_id in failed_ids:
+					continue
+				if successful_ids is not None and entry_id not in successful_ids:
+					continue
+				pending.append(handle)
+			if pending:
+				futures = [
+					self._executor().submit(self._delete_message_payload_from_s3, handle, True)
+					for handle in pending
+				]
+				for future in as_completed(futures):
+					future.result()
+		return result
 
 	def change_message_visibility(self, queue_url, receipt_handle, visibility_timeout, **kwargs):
 		if self._is_s3_receipt_handle(receipt_handle):
@@ -601,9 +732,53 @@ class SQSClientExtended:
 			params["MessageGroupId"] = message_group_id
 		if message_deduplication_id:
 			params["MessageDeduplicationId"] = message_deduplication_id
-		return self.sqs.send_message(**params)
+		try:
+			return self.sqs.send_message(**params)
+		except Exception:
+			if self._reserved_attribute_name_if_present(message_attributes):
+				self._best_effort_delete_pointer(body)
+			raise
+
+	def send_file(
+		self,
+		queue_url,
+		path,
+		message_group_id=None,
+		message_deduplication_id=None,
+		message_attributes=None,
+		**kwargs
+	):
+		"""Upload an existing file. ``path`` may be a string or ``os.PathLike``.
+
+		``send_message`` treats every ``str`` as text, including strings that happen
+		to name a file on disk. Use this method or pass a ``pathlib.Path``.
+		"""
+		return self.send_message(
+			queue_url,
+			pathlib.Path(os.fspath(path)),
+			message_group_id=message_group_id,
+			message_deduplication_id=message_deduplication_id,
+			message_attributes=message_attributes,
+			**kwargs
+		)
 
 	def send_message_batch(self, queue_url, entries, **kwargs):
+		if not self.config.payload_support_enabled:
+			prepared = []
+			for entry in entries:
+				entry = dict(entry)
+				body = entry.get("MessageBody")
+				if body is None:
+					raise ValueError("message_body required")
+				if not isinstance(body, str):
+					raise TypeError(
+						"payload support is disabled; MessageBody must be str, got %s" % type(body).__name__
+					)
+				prepared.append(entry)
+			params = {"QueueUrl": queue_url, "Entries": prepared}
+			params.update(kwargs)
+			return self.sqs.send_message_batch(**params)
+
 		prepared = []
 		offload_jobs = []
 		for index, entry in enumerate(entries):
@@ -642,6 +817,8 @@ class SQSClientExtended:
 					if first_error is None:
 						first_error = exc
 			if first_error is not None:
+				for pointer, _size_bytes, _is_binary, _attrs in results.values():
+					self._best_effort_delete_pointer(self._to_payload_s3_pointer_json(pointer))
 				raise first_error
 			for index, (pointer, size_bytes, is_binary, attrs) in results.items():
 				self._attach_offload_attributes(attrs, size_bytes, is_binary)
@@ -656,12 +833,28 @@ class SQSClientExtended:
 			sqs_entries.append(entry)
 		params = {"QueueUrl": queue_url, "Entries": sqs_entries}
 		params.update(kwargs)
-		return self.sqs.send_message_batch(**params)
+		try:
+			result = self.sqs.send_message_batch(**params)
+		except Exception:
+			for entry in sqs_entries:
+				if self._reserved_attribute_name_if_present(entry.get("MessageAttributes")):
+					self._best_effort_delete_pointer(entry.get("MessageBody"))
+			raise
+		failed_ids = {item.get("Id") for item in (result or {}).get("Failed") or []}
+		if failed_ids:
+			for entry in sqs_entries:
+				if entry.get("Id") in failed_ids and self._reserved_attribute_name_if_present(entry.get("MessageAttributes")):
+					self._best_effort_delete_pointer(entry.get("MessageBody"))
+		return result
 
 	def _s3_extra_args(self):
-		if not self.config.s3_canned_acl:
-			return None
-		return {"ACL": self.config.s3_canned_acl}
+		extra = {}
+		if self.config.s3_canned_acl:
+			extra["ACL"] = self.config.s3_canned_acl
+		strategy = self.config.server_side_encryption
+		if strategy is not None:
+			extra.update(strategy.extra_args())
+		return extra or None
 
 	def _store_message_in_s3(self, payload, size_bytes, is_streamable):
 		s3_key = self.config.s3_key_prefix + str(uuid.uuid4())
@@ -703,8 +896,33 @@ class SQSClientExtended:
 			)
 			raise
 
-	def get_payload_from_s3(self, s3_bucket_name, s3_key, as_binary=False):
+	def get_payload_from_s3(self, s3_bucket_name, s3_key, as_binary=False, filename=None):
+		"""Download an S3 payload.
+
+		Without ``filename``, the object is read fully into memory and returned as
+		``str`` (or ``bytes`` when ``as_binary`` is true). Pass ``filename`` to stream
+		the object to disk with ``download_file`` and return that path. That is the
+		same path ``receive_message(..., payload_dir=...)`` uses for large bodies.
+		"""
 		started = time.time()
+		if filename:
+			parent = os.path.dirname(filename)
+			if parent:
+				os.makedirs(parent, exist_ok=True)
+			self.s3.download_file(
+				s3_bucket_name,
+				s3_key,
+				filename,
+				Config=self._transfer_config(),
+			)
+			size = os.path.getsize(filename)
+			self._emit(
+				"s3_hydrate",
+				bytes=size,
+				s3_key=s3_key,
+				duration_ms=int((time.time() - started) * 1000),
+			)
+			return filename
 		buffer = BytesIO()
 		self.s3.download_fileobj(
 			s3_bucket_name,

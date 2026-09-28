@@ -88,7 +88,7 @@ def test_receive_hydrates_multiple_pointers():
 	assert len(mock_s3.get_calls) == 3
 
 
-def test_delete_batch_issues_parallel_s3_deletes_then_one_sqs_batch():
+def test_delete_batch_issues_one_sqs_batch_then_parallel_s3_deletes():
 	client, mock_sqs, mock_s3 = make_client()
 	handles = []
 	for key in ("a", "b", "c"):

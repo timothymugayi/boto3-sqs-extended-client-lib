@@ -38,6 +38,9 @@ class ExtendedClientConfiguration:
 		multipart_threshold=DEFAULT_MULTIPART_THRESHOLD,
 		endpoint_url=None,
 		s3_canned_acl=None,
+		server_side_encryption=None,
+		payload_support_enabled=True,
+		delete_s3_before_sqs=False,
 		on_event=None,
 	):
 		object.__setattr__(self, "_frozen", False)
@@ -58,6 +61,12 @@ class ExtendedClientConfiguration:
 		self.multipart_threshold = multipart_threshold
 		self.endpoint_url = endpoint_url
 		self.s3_canned_acl = s3_canned_acl
+		self.server_side_encryption = server_side_encryption
+		self.payload_support_enabled = payload_support_enabled
+		# Java deletes the S3 object before DeleteMessage. That leaves a dead
+		# pointer when SQS delete fails. The default here deletes SQS first and
+		# then best-effort cleans S3. Set delete_s3_before_sqs=True for the Java order.
+		self.delete_s3_before_sqs = delete_s3_before_sqs
 		self.on_event = on_event
 
 	def freeze(self):

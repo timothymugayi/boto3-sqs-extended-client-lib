@@ -77,7 +77,7 @@ def test_file_path_uses_upload_file(tmp_path):
 	payload_path = tmp_path / "video.bin"
 	payload_path.write_bytes(b"\xff" * 32)
 	client, mock_sqs, mock_s3 = make_client(message_size_threshold=8)
-	client.send_message("https://sqs.example/queue", str(payload_path))
+	client.send_message("https://sqs.example/queue", payload_path)
 	assert mock_s3.put_calls[0]["UploadMethod"] == "upload_file"
 	assert mock_s3.put_calls[0]["Body"] == b"\xff" * 32
 	sent = mock_sqs.send_calls[0]
@@ -108,7 +108,7 @@ def test_small_file_stays_in_sqs_as_base64(tmp_path):
 	payload_path = tmp_path / "tiny.bin"
 	payload_path.write_bytes(b"xy")
 	client, mock_sqs, mock_s3 = make_client()
-	client.send_message("https://sqs.example/queue", str(payload_path))
+	client.send_message("https://sqs.example/queue", payload_path)
 	assert mock_s3.put_calls == []
 	assert base64.b64decode(mock_sqs.send_calls[0]["MessageBody"]) == b"xy"
 

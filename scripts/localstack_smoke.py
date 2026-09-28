@@ -112,7 +112,7 @@ def check_file_path_and_fileobj():
 	try:
 		with open(path, "wb") as handle:
 			handle.write(path_payload)
-		client.send_message(queue_url, path)
+		client.send_file(queue_url, path)
 		client.send_message(queue_url, BytesIO(file_payload))
 		messages = client.receive_message(queue_url, max_number_of_messages=2, wait_time_seconds=5)
 		if not messages or len(messages) != 2:
@@ -125,7 +125,7 @@ def check_file_path_and_fileobj():
 		client.close()
 		if os.path.exists(path):
 			os.remove(path)
-	print("ok  file path and file object round-trip as bytes")
+	print("ok  send_file and file object round-trip as bytes")
 
 
 def check_multipart():
