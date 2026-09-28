@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import pathlib
@@ -373,3 +374,254 @@ def test_builtin_clients_do_not_retain_access_keys(monkeypatch):
 	assert "aws_access_key_id" not in created[0]
 	assert "aws_secret_access_key" not in created[0]
 	assert "aws_access_key_id" not in vars(client)
+
+	created.clear()
+	SQSClientExtended(aws_region_name="eu-west-1", s3_bucket_name="test-bucket")
+	assert created[0]["region_name"] == "eu-west-1"
+	assert "aws_access_key_id" not in created[0]
+	assert "aws_secret_access_key" not in created[0]
+
+
+def test_string_and_binary_attribute_sizes_accept_bytes_and_reject_other_types():
+	client, mock_sqs, _ = make_client()
+	client.send_message(
+		"https://sqs.example/queue",
+		"hello",
+		message_attributes={"blob": {"DataType": "Binary", "BinaryValue": "raw-text"}},
+	)
+	assert mock_sqs.send_calls[0]["MessageAttributes"]["blob"]["BinaryValue"] == "raw-text"
+
+	client, _, _ = make_client(message_size_threshold=8)
+	with pytest.raises(ValueError, match="Message attributes"):
+		client.send_message(
+			"https://sqs.example/queue",
+			"hi",
+			message_attributes={"n": {"DataType": "String", "StringValue": b"abcdefghij"}},
+		)
+	with pytest.raises(TypeError, match="BinaryValue"):
+		client.send_message(
+			"https://sqs.example/queue",
+			"hi",
+			message_attributes={"blob": {"DataType": "Binary", "BinaryValue": 5}},
+		)
+
+
+def test_payload_support_disabled_rejects_non_text_send_and_batch():
+	client, mock_sqs, mock_s3 = make_client(payload_support_enabled=False)
+	with pytest.raises(TypeError, match="payload support is disabled"):
+		client.send_message("https://sqs.example/queue", b"\x00")
+	with pytest.raises(TypeError, match="payload support is disabled"):
+		client.send_file("https://sqs.example/queue", "anywhere.bin")
+	client.send_message_batch(
+		"https://sqs.example/queue",
+		[{"Id": "1", "MessageBody": "plain"}],
+	)
+	assert mock_sqs.send_batch_calls[0]["Entries"][0]["MessageBody"] == "plain"
+	assert mock_s3.put_calls == []
+	with pytest.raises(ValueError, match="message_body required"):
+		client.send_message_batch(
+			"https://sqs.example/queue",
+			[{"Id": "1", "MessageBody": None}],
+		)
+	with pytest.raises(TypeError, match="MessageBody must be str"):
+		client.send_message_batch(
+			"https://sqs.example/queue",
+			[{"Id": "1", "MessageBody": b"bin"}],
+		)
+
+
+def test_receive_decodes_s3_binary_b64_payload():
+	client, mock_sqs, mock_s3 = make_client()
+	raw = b"\x00\x01\xff"
+	mock_s3.objects[("test-bucket", "abc-key")] = base64.b64encode(raw)
+	mock_sqs.receive_response = {
+		"Messages": [{
+			"Body": json.dumps([
+				PAYLOAD_S3_POINTER_CLASS,
+				{"s3BucketName": "test-bucket", "s3Key": "abc-key"},
+			]),
+			"ReceiptHandle": "orig-handle",
+			"MessageAttributes": {
+				"SQSLargePayloadSize": {"StringValue": "4", "DataType": "Number"},
+				"SQSExtendedContentType": {"StringValue": "binary-b64", "DataType": "String"},
+			},
+		}]
+	}
+	messages = client.receive_message("https://sqs.example/queue")
+	assert messages[0]["Body"] == raw
+	assert messages[0]["_is_binary"] is True
+
+
+def test_best_effort_pointer_delete_ignores_bodies_that_are_not_s3_pointers():
+	client, _, mock_s3 = make_client()
+	client._best_effort_delete_pointer("not-json")
+	client._best_effort_delete_pointer(None)
+	client._best_effort_delete_pointer("[1, 2]")
+	client._best_effort_delete_pointer('{"s3BucketName": "test-bucket"}')
+	client._best_effort_delete_pointer('{"s3BucketName": "", "s3Key": "k"}')
+	assert mock_s3.delete_calls == []
+
+
+def test_delete_batch_s3_before_sqs_removes_objects_then_queue_batch():
+	order = []
+
+	class OrderingSqs(FakeSqs):
+		def delete_message_batch(self, **kwargs):
+			order.append("sqs")
+			return super().delete_message_batch(**kwargs)
+
+	class OrderingS3(FakeS3):
+		def delete_object(self, **kwargs):
+			order.append("s3")
+			return super().delete_object(**kwargs)
+
+	mock_s3 = OrderingS3()
+	mock_s3.objects[("test-bucket", "abc-key")] = b"payload"
+	client = SQSClientExtended(
+		sqs_client=OrderingSqs(),
+		s3_client=mock_s3,
+		config=ExtendedClientConfiguration(
+			s3_bucket_name="test-bucket",
+			delete_s3_before_sqs=True,
+		),
+	)
+	client.delete_message_batch(
+		"https://sqs.example/queue",
+		[{"Id": "1", "ReceiptHandle": EMBEDDED_HANDLE}],
+	)
+	assert order == ["s3", "sqs"]
+	assert ("test-bucket", "abc-key") not in mock_s3.objects
+
+
+def test_delete_batch_s3_before_sqs_logs_dead_pointers_when_queue_batch_fails(caplog):
+	class FailingSqs(FakeSqs):
+		def delete_message_batch(self, **kwargs):
+			self.delete_batch_calls.append(kwargs)
+			raise RuntimeError("batch down")
+
+	mock_s3 = FakeS3()
+	mock_s3.objects[("test-bucket", "abc-key")] = b"payload"
+	client = SQSClientExtended(
+		sqs_client=FailingSqs(),
+		s3_client=mock_s3,
+		config=ExtendedClientConfiguration(
+			s3_bucket_name="test-bucket",
+			delete_s3_before_sqs=True,
+		),
+	)
+	with caplog.at_level(logging.ERROR):
+		with pytest.raises(RuntimeError, match="batch down"):
+			client.delete_message_batch(
+				"https://sqs.example/queue",
+				[{"Id": "1", "ReceiptHandle": EMBEDDED_HANDLE}],
+			)
+	assert ("test-bucket", "abc-key") not in mock_s3.objects
+	assert "dead pointers" in caplog.text
+
+
+def test_s3_first_delete_propagates_s3_failure_without_deleting_sqs():
+	class FailingDeleteS3(FakeS3):
+		def delete_object(self, **kwargs):
+			self.delete_calls.append(kwargs)
+			raise RuntimeError("s3 down")
+
+	mock_sqs = FakeSqs()
+	client = SQSClientExtended(
+		sqs_client=mock_sqs,
+		s3_client=FailingDeleteS3(),
+		config=ExtendedClientConfiguration(
+			s3_bucket_name="test-bucket",
+			delete_s3_before_sqs=True,
+		),
+	)
+	with pytest.raises(RuntimeError, match="s3 down"):
+		client.delete_message("https://sqs.example/queue", EMBEDDED_HANDLE)
+	assert mock_sqs.delete_calls == []
+
+
+def test_delete_batch_skips_s3_cleanup_when_id_missing_from_successful():
+	class PartialSqs(FakeSqs):
+		def delete_message_batch(self, **kwargs):
+			self.delete_batch_calls.append(kwargs)
+			return {"Successful": [{"Id": "ok"}], "Failed": []}
+
+	mock_sqs = PartialSqs()
+	mock_s3 = FakeS3()
+	mock_s3.objects[("test-bucket", "ok-key")] = b"ok"
+	mock_s3.objects[("test-bucket", "skipped-key")] = b"skip"
+	client = SQSClientExtended(
+		sqs_client=mock_sqs,
+		s3_client=mock_s3,
+		config=ExtendedClientConfiguration(s3_bucket_name="test-bucket"),
+	)
+
+	def handle(key):
+		return (
+			"-..s3BucketName..-test-bucket-..s3BucketName..-"
+			"-..s3Key..-{}-..s3Key..-orig".format(key)
+		)
+
+	client.delete_message_batch(
+		"https://sqs.example/queue",
+		[
+			{"Id": "ok", "ReceiptHandle": handle("ok-key")},
+			{"Id": "skipped", "ReceiptHandle": handle("skipped-key")},
+		],
+	)
+	assert {call["Key"] for call in mock_s3.delete_calls} == {"ok-key"}
+	assert mock_s3.objects[("test-bucket", "skipped-key")] == b"skip"
+
+
+def test_send_batch_failure_deletes_offloaded_objects_and_partial_failures():
+	class FailingSqs(FakeSqs):
+		def send_message_batch(self, **kwargs):
+			self.send_batch_calls.append(kwargs)
+			raise RuntimeError("sqs down")
+
+	mock_s3 = FakeS3()
+	client = SQSClientExtended(
+		sqs_client=FailingSqs(),
+		s3_client=mock_s3,
+		config=ExtendedClientConfiguration(s3_bucket_name="test-bucket", always_through_s3=True),
+	)
+	with pytest.raises(RuntimeError, match="sqs down"):
+		client.send_message_batch(
+			"https://sqs.example/queue",
+			[{"Id": "1", "MessageBody": "one"}, {"Id": "2", "MessageBody": "two"}],
+		)
+	assert mock_s3.objects == {}
+	assert len(mock_s3.delete_calls) == 2
+
+	class PartialSqs(FakeSqs):
+		def send_message_batch(self, **kwargs):
+			self.send_batch_calls.append(kwargs)
+			return {
+				"Successful": [{"Id": "ok"}],
+				"Failed": [{"Id": "bad", "Code": "InternalError", "SenderFault": False}],
+			}
+
+	mock_sqs = PartialSqs()
+	mock_s3 = FakeS3()
+	client = SQSClientExtended(
+		sqs_client=mock_sqs,
+		s3_client=mock_s3,
+		config=ExtendedClientConfiguration(s3_bucket_name="test-bucket", always_through_s3=True),
+	)
+	client.send_message_batch(
+		"https://sqs.example/queue",
+		[{"Id": "ok", "MessageBody": "kept"}, {"Id": "bad", "MessageBody": "drop"}],
+	)
+	entries = {entry["Id"]: entry for entry in mock_sqs.send_batch_calls[0]["Entries"]}
+	ok_key = json.loads(entries["ok"]["MessageBody"])[1]["s3Key"]
+	bad_key = json.loads(entries["bad"]["MessageBody"])[1]["s3Key"]
+	assert mock_s3.objects[("test-bucket", ok_key)] == b"kept"
+	assert ("test-bucket", bad_key) not in mock_s3.objects
+
+
+def test_customer_key_rejects_blank_kms_key_id():
+	with pytest.raises(ValueError, match="aws_kms_key_id"):
+		customer_key("")
+	with pytest.raises(ValueError, match="aws_kms_key_id"):
+		customer_key(None)
+	with pytest.raises(ValueError, match="aws_kms_key_id"):
+		customer_key("   ")
