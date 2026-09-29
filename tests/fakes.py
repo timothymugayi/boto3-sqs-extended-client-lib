@@ -1,3 +1,4 @@
+import os
 import threading
 
 from botocore.exceptions import ClientError
@@ -69,7 +70,19 @@ class FakeS3:
 
 	def download_fileobj(self, Bucket, Key, Fileobj, ExtraArgs=None, Callback=None, Config=None):
 		resp = self.get_object(Bucket=Bucket, Key=Key)
+		if self.get_calls:
+			self.get_calls[-1]["DownloadMethod"] = "download_fileobj"
 		Fileobj.write(resp["Body"].read())
+
+	def download_file(self, Bucket, Key, Filename, ExtraArgs=None, Callback=None, Config=None):
+		resp = self.get_object(Bucket=Bucket, Key=Key)
+		if self.get_calls:
+			self.get_calls[-1]["DownloadMethod"] = "download_file"
+		directory = os.path.dirname(Filename)
+		if directory:
+			os.makedirs(directory, exist_ok=True)
+		with open(Filename, "wb") as handle:
+			handle.write(resp["Body"].read())
 
 	def delete_object(self, **kwargs):
 		if self.sleep_seconds:
@@ -113,7 +126,8 @@ class FakeSqs:
 
 	def delete_message_batch(self, **kwargs):
 		self.delete_batch_calls.append(kwargs)
-		return {"Successful": [], "Failed": []}
+		successful = [{"Id": entry.get("Id")} for entry in kwargs.get("Entries", [])]
+		return {"Successful": successful, "Failed": []}
 
 	def change_message_visibility(self, **kwargs):
 		self.visibility_calls.append(kwargs)

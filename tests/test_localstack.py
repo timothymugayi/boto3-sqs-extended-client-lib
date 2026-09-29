@@ -123,7 +123,7 @@ def test_localstack_file_path_and_fileobj_round_trip(tmp_path):
 	payload_path = tmp_path / "video.bin"
 	payload_path.write_bytes(path_payload)
 	try:
-		client.send_message(queue_url, str(payload_path))
+		client.send_file(queue_url, payload_path)
 		client.send_message(queue_url, BytesIO(file_payload))
 		messages = client.receive_message(queue_url, max_number_of_messages=2, wait_time_seconds=5)
 		assert messages and len(messages) == 2

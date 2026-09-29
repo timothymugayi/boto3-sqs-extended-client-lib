@@ -1,0 +1,37 @@
+name: Publish to PyPI
+
+# Builds and uploads a release using PyPI Trusted Publishing (OIDC).
+# No long-lived PyPI token is stored in this repository.
+#
+# Before the first upload, the maintainer must:
+# 1. Own the PyPI project pysqs-extended-client (it currently serves 0.0.1 only; see issue #19).
+# 2. Add a Trusted Publisher: owner timothymugayi, repo boto3-sqs-extended-client-lib,
+#    workflow publish.yml, environment name pypi.
+# 3. Create a GitHub environment named "pypi" (no reviewers required unless you want a gate).
+# 4. Publish a GitHub Release. This workflow then uploads that commit's sdist and wheel.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish pysqs-extended-client
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

@@ -84,9 +84,13 @@ def test_injected_clients_are_not_rebuilt(monkeypatch):
 def test_config_is_frozen_after_client_init():
 	client, _, _ = _client()
 	with pytest.raises(FrozenConfigError):
-		client.set_always_through_s3(True)
+		client.config.always_through_s3 = True
+	with pytest.raises(FrozenConfigError):
+		client.config.message_size_threshold = 10
 	with pytest.raises(FrozenConfigError):
 		client.config.s3_bucket_name = "other"
+	assert "set_always_through_s3" not in SQSClientExtended.__dict__
+	assert "set_message_size_threshold" not in SQSClientExtended.__dict__
 
 
 def test_is_large_payload_support_enabled_returns_true():
