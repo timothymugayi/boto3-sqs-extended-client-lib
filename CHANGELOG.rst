@@ -1,6 +1,11 @@
 Changelog
 =========
 
+0.5.1
+-----
+
+* A credential refresh that fails during a boto3 retry is not a definite SQS rejection. botocore re-signs, and may refresh credentials, before every retry attempt, so ``CredentialRetrievalError`` and ``PartialCredentialsError`` can be raised after attempt 1 already reached SQS. Those errors keep the uploaded object, emit ``s3_object_orphaned`` with ``case=after_sqs_uncertain``, and are re-raised. ``NoCredentialsError`` stays definite: the signer raises it when the credentials object is None, which fails the first signature before any HTTP attempt, and a later retry does not clear that object. ``UnknownCredentialError`` stays definite: it is a named-provider lookup before a request. A 4xx ``ClientError`` is a definite rejection only when its operation is ``SendMessage`` or ``SendMessageBatch`` and ``RetryAttempts`` is explicitly 0. A 4xx from another operation, such as STS ``AssumeRole`` during a refresh, is uncertain, so the object is kept.
+
 0.5.0
 -----
 

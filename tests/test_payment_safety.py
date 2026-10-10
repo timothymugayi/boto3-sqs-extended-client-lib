@@ -7,12 +7,14 @@ import os
 import pytest
 from botocore.exceptions import (
 	ClientError,
+	CredentialRetrievalError,
 	EndpointConnectionError,
 	MissingParametersError,
 	NoCredentialsError,
 	ParamValidationError,
 	PartialCredentialsError,
 	ReadTimeoutError,
+	UnknownCredentialError,
 	ValidationError,
 )
 
@@ -65,7 +67,7 @@ def _pointer_message(bucket="test-bucket", key="missing-key", receipt="orig-hand
 	}
 
 
-def _client_error(code, status=None, retry_attempts=None):
+def _client_error(code, status=None, retry_attempts=None, operation="GetObject"):
 	response = {"Error": {"Code": code, "Message": code}}
 	meta = {}
 	if status is not None:
@@ -74,7 +76,7 @@ def _client_error(code, status=None, retry_attempts=None):
 		meta["RetryAttempts"] = retry_attempts
 	if meta:
 		response["ResponseMetadata"] = meta
-	return ClientError(response, "GetObject")
+	return ClientError(response, operation)
 
 
 def test_inline_binary_content_type_attribute_is_38_bytes():
@@ -730,7 +732,9 @@ def test_send_cleanup_success_does_not_emit_the_orphan_reason():
 	class FailingSqs(FakeSqs):
 		def send_message(self, **kwargs):
 			self.send_calls.append(kwargs)
-			raise _client_error("InvalidParameterValue", status=400, retry_attempts=0)
+			raise _client_error(
+				"InvalidParameterValue", status=400, retry_attempts=0, operation="SendMessage"
+			)
 
 	events = []
 	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
@@ -747,7 +751,9 @@ def test_batch_send_rejection_cleanup_failure_names_the_orphan_case():
 	class FailingSqs(FakeSqs):
 		def send_message_batch(self, **kwargs):
 			self.send_batch_calls.append(kwargs)
-			raise _client_error("InvalidParameterValue", status=400, retry_attempts=0)
+			raise _client_error(
+				"InvalidParameterValue", status=400, retry_attempts=0, operation="SendMessageBatch"
+			)
 
 	class CleanupFails(FakeS3):
 		def delete_object(self, **kwargs):
@@ -1054,7 +1060,9 @@ def test_definite_batch_rejection_deletes_offloaded_objects():
 	class FailingSqs(FakeSqs):
 		def send_message_batch(self, **kwargs):
 			self.send_batch_calls.append(kwargs)
-			raise _client_error("InvalidParameterValue", status=400, retry_attempts=0)
+			raise _client_error(
+				"InvalidParameterValue", status=400, retry_attempts=0, operation="SendMessageBatch"
+			)
 
 	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
 	client.sqs = FailingSqs()
@@ -1311,10 +1319,27 @@ def test_client_error_without_an_integer_status_is_not_a_definite_rejection():
 	bool_status = _client_error("InternalError")
 	bool_status.response = {"ResponseMetadata": {"HTTPStatusCode": True}}
 	assert client._is_definite_sqs_rejection(bool_status) is False
-	assert client._is_definite_sqs_rejection(_client_error("InvalidParameterValue", status=400)) is False
-	assert client._is_definite_sqs_rejection(_client_error("InvalidParameterValue", status=400, retry_attempts=0)) is True
-	assert client._is_definite_sqs_rejection(_client_error("RequestThrottled", status=400, retry_attempts=3)) is False
-	assert client._is_definite_sqs_rejection(_client_error("InternalError", status=500)) is False
+	assert client._is_definite_sqs_rejection(
+		_client_error("InvalidParameterValue", status=400, operation="SendMessage")
+	) is False
+	assert client._is_definite_sqs_rejection(
+		_client_error("InvalidParameterValue", status=400, retry_attempts=0, operation="SendMessage")
+	) is True
+	assert client._is_definite_sqs_rejection(
+		_client_error("InvalidParameterValue", status=400, retry_attempts=0, operation="SendMessageBatch")
+	) is True
+	assert client._is_definite_sqs_rejection(
+		_client_error("AccessDenied", status=403, retry_attempts=0, operation="AssumeRole")
+	) is False
+	assert client._is_definite_sqs_rejection(
+		_client_error("AccessDenied", status=403, retry_attempts=0, operation="GetObject")
+	) is False
+	assert client._is_definite_sqs_rejection(
+		_client_error("RequestThrottled", status=400, retry_attempts=3, operation="SendMessage")
+	) is False
+	assert client._is_definite_sqs_rejection(
+		_client_error("InternalError", status=500, operation="SendMessage")
+	) is False
 	blank = _client_error("RequestThrottled", status=400)
 	blank.response = None
 	assert client._retry_attempts(blank) is None
@@ -1335,7 +1360,9 @@ def test_client_error_without_an_integer_status_is_not_a_definite_rejection():
 
 
 def test_retried_400_keeps_the_object_on_send_and_batch():
-	error = _client_error("RequestThrottled", status=400, retry_attempts=3)
+	error = _client_error(
+		"RequestThrottled", status=400, retry_attempts=3, operation="SendMessage"
+	)
 
 	class FailingSqs(FakeSqs):
 		def send_message(self, **kwargs):
@@ -1406,7 +1433,7 @@ def test_pre_send_validation_error_deletes_the_object():
 
 def test_4xx_without_retry_attempts_keeps_the_object():
 	"""A 4xx is definite only when RetryAttempts is explicitly 0."""
-	error = _client_error("InvalidParameterValue", status=400)
+	error = _client_error("InvalidParameterValue", status=400, operation="SendMessage")
 	assert "RetryAttempts" not in error.response["ResponseMetadata"]
 
 	class FailingSqs(FakeSqs):
@@ -1441,7 +1468,8 @@ def test_credential_error_before_send_deletes_the_object_and_connection_error_do
 
 	assert client._is_definite_sqs_rejection(
 		PartialCredentialsError(provider="env", cred_var="aws_secret_access_key")
-	) is True
+	) is False
+	assert client._is_definite_sqs_rejection(UnknownCredentialError(name="env")) is True
 	connection = EndpointConnectionError(endpoint_url="https://sqs.us-east-1.amazonaws.com/")
 	assert client._is_definite_sqs_rejection(connection) is False
 
@@ -1458,3 +1486,64 @@ def test_credential_error_before_send_deletes_the_object_and_connection_error_do
 	assert len(mock_s3.objects) == 1
 	cases = [fields["case"] for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
 	assert cases == [ORPHAN_AFTER_SQS_UNCERTAIN]
+
+
+def _refresh_failure_after_attempt_reached_sqs(error):
+	"""boto3's retry loop lives inside one send call.
+
+	Attempt 1 is recorded as having reached SQS. The error raised is the
+	credential-refresh failure botocore surfaces while re-signing the retry.
+	"""
+
+	class RefreshFailsOnRetry(FakeSqs):
+		def send_message(self, **kwargs):
+			self.send_calls.append(kwargs)
+			raise error
+
+		def send_message_batch(self, **kwargs):
+			self.send_batch_calls.append(kwargs)
+			raise error
+
+	return RefreshFailsOnRetry()
+
+
+def _assert_refresh_failure_keeps_payloads(error):
+	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
+	assert client._is_definite_sqs_rejection(error) is False
+	failing = _refresh_failure_after_attempt_reached_sqs(error)
+	client.sqs = failing
+	with pytest.raises(type(error)):
+		client.send_message(STANDARD_URL, "hello")
+	with pytest.raises(type(error)):
+		client.send_message_batch(
+			STANDARD_URL,
+			[{"Id": "1", "MessageBody": "one"}, {"Id": "2", "MessageBody": "two"}],
+		)
+	assert len(failing.send_calls) == 1
+	assert len(failing.send_batch_calls) == 1
+	assert mock_s3.delete_calls == []
+	assert len(mock_s3.objects) == 3
+	cases = [fields["case"] for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
+	assert cases == [
+		ORPHAN_AFTER_SQS_UNCERTAIN,
+		ORPHAN_AFTER_SQS_UNCERTAIN,
+		ORPHAN_AFTER_SQS_UNCERTAIN,
+	]
+
+
+def test_credential_retrieval_error_after_attempt_one_keeps_the_object():
+	_assert_refresh_failure_keeps_payloads(
+		CredentialRetrievalError(provider="env", error_msg="refresh failed")
+	)
+
+
+def test_partial_credentials_error_after_attempt_one_keeps_the_object():
+	_assert_refresh_failure_keeps_payloads(
+		PartialCredentialsError(provider="env", cred_var="aws_secret_access_key")
+	)
+
+
+def test_sts_4xx_during_credential_refresh_keeps_the_object():
+	_assert_refresh_failure_keeps_payloads(
+		_client_error("AccessDenied", status=403, retry_attempts=0, operation="AssumeRole")
+	)

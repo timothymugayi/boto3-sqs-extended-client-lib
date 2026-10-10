@@ -4,7 +4,7 @@ Boto3 SQS Extended Client Library for Python
 [![Tests](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/actions/workflows/tests.yml)
 [![codecov](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib/branch/master/graph/badge.svg)](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib)
 
-The **Amazon SQS Extended Client Library for Python** (version **0.5.0**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit) and puts a pointer on the queue.
+The **Amazon SQS Extended Client Library for Python** (version **0.5.1**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit) and puts a pointer on the queue.
 
 You can:
 
@@ -27,13 +27,7 @@ Requires Python 3.9+.
 
 PyPI project `pysqs-extended-client` is stuck at **0.0.1** until the account is recovered ([issue #19](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/issues/19)). `0.0.1` does not include the extended client in this tree. Do not `pip install pysqs-extended-client` without a pin.
 
-PyPI publishing of this release is coming once that account is recovered. Until then, install 0.5.0 from the git tag:
-
-```bash
-pip install git+https://github.com/timothymugayi/boto3-sqs-extended-client-lib@v0.5.0
-```
-
-Install a specific commit. Pin the full commit SHA of the revision you deploy. A branch name moves.
+PyPI publishing of this release is coming once that account is recovered. Until then, install 0.5.1 by pinning the commit SHA of the revision you deploy. A branch name moves, and this release is not tagged.
 
 ```bash
 pip install "pysqs-extended-client @ git+https://github.com/timothymugayi/boto3-sqs-extended-client-lib.git@<commit-sha>"

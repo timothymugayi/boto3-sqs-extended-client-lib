@@ -6,9 +6,9 @@ Producer and consumer policies, and cross-account access to the payload bucket.
 
 <a id="iam"></a>
 
-### IAM
+## IAM
 
-Prefer one role for producers and one for consumers. Scope S3 to the payload prefix. Add the KMS statements only when `server_side_encryption` is a KMS strategy. `sqs:GetQueueAttributes` is required in 0.5.0 for FIFO send, batch send, and receive. A least-privilege FIFO producer that previously only allowed `sqs:SendMessage` must add it or those calls fail closed.
+Prefer one role for producers and one for consumers. Use a dedicated payload bucket. Object actions (`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`) can be limited to the payload prefix. `s3:ListBucket` cannot: it is granted on the bucket ARN, and a prefix condition does not change `GetObject`. A shared bucket would let the consumer list every key. Add the KMS statements only when `server_side_encryption` is a KMS strategy. `sqs:GetQueueAttributes` is required in 0.5.0 for FIFO send, batch send, and receive. A least-privilege FIFO producer that previously only allowed `sqs:SendMessage` must add it or those calls fail closed.
 
 Producer (send). `s3:DeleteObject` is what delete-on-rejection uses. Without it, a definite SQS rejection cannot remove the object that was just uploaded.
 
@@ -65,9 +65,31 @@ Consumer (receive, delete, visibility). `s3:DeleteObject` is required only when 
 }
 ```
 
-### Cross-account S3 payloads
+## Cross-account S3 payloads
 
-Uploads default to the bucket's Object Ownership settings (no canned ACL). Prefer a **bucket policy** that grants the consuming account `s3:GetObject` (and `s3:DeleteObject` if `cleanup_s3_payload` is on).
+Uploads default to the bucket's Object Ownership settings (no canned ACL). Prefer a **bucket policy** that grants the consuming account `s3:GetObject` (and `s3:DeleteObject` if `cleanup_s3_payload` is on) on the payload prefix, and `s3:ListBucket` on the bucket ARN. Leave off any `s3:prefix` condition. Without bucket-level `ListBucket`, a missing object returns 403 instead of 404, `message_left` never fires, and the message dead-letters silently.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadPayloadObjects",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::111122223333:role/consumer"},
+      "Action": ["s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::my-payload-bucket/payloads/*"
+    },
+    {
+      "Sid": "ListPayloadBucket",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::111122223333:role/consumer"},
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::my-payload-bucket"
+    }
+  ]
+}
+```
 
 If you still need a canned ACL, set `s3_canned_acl` (for example `"bucket-owner-read"` or `"bucket-owner-full-control"`). That is passed as `ExtraArgs={"ACL": ...}` on `upload_fileobj`. Buckets with Object Ownership **BucketOwnerEnforced** reject ACLs; leave `s3_canned_acl` unset in that case.
 
