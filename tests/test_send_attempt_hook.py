@@ -28,7 +28,9 @@ from pysqs_extended_client.SQSClientExtended import (
 	ORPHAN_AFTER_SQS_UNCERTAIN,
 	SQSClientExtended,
 	_SEND_ATTEMPT_TRACKERS,
+	_SEND_ATTEMPT_TRACKERS_LOCK,
 	_SQS_SEND_ATTEMPT_HOOK_PREFIX,
+	_tracker_for,
 )
 from pysqs_extended_client.extended_config import ExtendedClientConfiguration
 from tests.fakes import FakeS3
@@ -477,6 +479,43 @@ def test_unhashable_sqs_client_still_records_before_send():
 	first.close()
 	assert first._sqs_attempt_hook_registered is True
 	assert _before_send_hook_ids(sqs) == ["pysqs-extended-client-before-send"]
+
+
+def test_cyclic_client_finalizer_does_not_deadlock_under_the_tracker_lock():
+	sqs = _bare_sqs()
+	wrapped = _wrapped(sqs)
+	client_id = id(sqs)
+	assert client_id in _SEND_ATTEMPT_TRACKERS
+	cycle = [sqs]
+	sqs._test_cycle = cycle
+	# Cyclic garbage is not collected while the GC is disabled, so the
+	# finalizer cannot run until this thread holds the tracker lock.
+	worker = None
+	done = {}
+	gc.disable()
+	try:
+		del wrapped
+		del sqs
+		del cycle
+		assert client_id in _SEND_ATTEMPT_TRACKERS
+
+		def collect_while_holding_the_lock():
+			_SEND_ATTEMPT_TRACKERS_LOCK.acquire()
+			try:
+				gc.collect()
+				_tracker_for(_bare_sqs())
+				done["ok"] = client_id not in _SEND_ATTEMPT_TRACKERS
+			finally:
+				_SEND_ATTEMPT_TRACKERS_LOCK.release()
+
+		worker = threading.Thread(target=collect_while_holding_the_lock)
+		worker.daemon = True
+		worker.start()
+		worker.join(timeout=5)
+	finally:
+		gc.enable()
+	assert worker is not None and not worker.is_alive()
+	assert done.get("ok") is True
 
 
 def test_tracker_is_dropped_when_the_sqs_client_is_collected():

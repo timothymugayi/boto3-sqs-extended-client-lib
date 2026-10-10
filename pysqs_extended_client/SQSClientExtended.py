@@ -100,7 +100,9 @@ _SQS_SEND_ATTEMPT_HOOK_PREFIX = "pysqs-extended-client-before-send"
 # extended client, and it is not removed by close().
 _SEND_ATTEMPT_TRACKERS = {}
 _SEND_ATTEMPT_REFS = {}
-_SEND_ATTEMPT_TRACKERS_LOCK = threading.Lock()
+# RLock: a cyclic SQS client can be collected on this thread while _tracker_for
+# holds the lock. The finalizer only removes its own weakref, so re-entry is safe.
+_SEND_ATTEMPT_TRACKERS_LOCK = threading.RLock()
 
 
 class _SendAttemptTracker:
