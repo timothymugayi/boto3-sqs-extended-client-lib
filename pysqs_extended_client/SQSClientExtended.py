@@ -16,8 +16,12 @@ from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import (
 	ClientError,
+	CredentialRetrievalError,
 	MissingParametersError,
+	NoCredentialsError,
 	ParamValidationError,
+	PartialCredentialsError,
+	UnknownCredentialError,
 	ValidationError,
 )
 
@@ -975,34 +979,54 @@ class SQSClientExtended:
 		return status
 
 	def _retry_attempts(self, exc):
+		"""Return an explicit ``RetryAttempts`` int, or None when it is absent.
+
+		Missing metadata is not zero. Only a present value of 0 means boto3
+		did not retry, so a 4xx with the key omitted stays uncertain.
+		"""
 		response = getattr(exc, "response", None)
 		if not isinstance(response, dict):
-			return 0
+			return None
 		meta = response.get("ResponseMetadata")
-		if not isinstance(meta, dict):
-			return 0
-		return meta.get("RetryAttempts", 0)
+		if not isinstance(meta, dict) or "RetryAttempts" not in meta:
+			return None
+		attempts = meta.get("RetryAttempts")
+		if isinstance(attempts, bool) or not isinstance(attempts, int):
+			return None
+		return attempts
 
 	def _is_pre_send_validation_error(self, exc):
 		"""True when botocore rejected the call before the request was sent.
 
 		``ParamValidationError`` is the usual case. ``ValidationError`` covers
 		alias conflicts and unknown parameters. ``MissingParametersError`` is
-		the same class of client-side check. None of these mean SQS stored
-		the message.
+		the same class of client-side check. Credential errors
+		(``NoCredentialsError`` and the same family) are raised while resolving
+		credentials, also before any request. ``EndpointConnectionError`` is
+		not in this set: the request may already have been sent. None of the
+		included errors mean SQS stored the message.
 		"""
-		return isinstance(exc, (ParamValidationError, ValidationError, MissingParametersError))
+		return isinstance(exc, (
+			ParamValidationError,
+			ValidationError,
+			MissingParametersError,
+			NoCredentialsError,
+			PartialCredentialsError,
+			CredentialRetrievalError,
+			UnknownCredentialError,
+		))
 
 	def _is_definite_sqs_rejection(self, exc):
 		"""True only when SQS definitely refused the send.
 
 		A botocore ``ClientError`` whose HTTP status is 4xx is a rejection
-		only when ``RetryAttempts`` is 0. boto3 retries a timeout, then a
-		later 400 ``RequestThrottled`` can report ``RetryAttempts`` greater
-		than 0: the first attempt may already be stored. That case is
-		uncertain. A client-side validation error is a rejection because the
-		request was never sent. Timeouts, connection errors, 5xx, and a
-		``ClientError`` with no status are uncertain.
+		only when ``RetryAttempts`` is explicitly 0. A missing value is not
+		zero. boto3 retries a timeout, then a later 400 ``RequestThrottled``
+		can report ``RetryAttempts`` greater than 0: the first attempt may
+		already be stored. That case is uncertain. A client-side validation
+		error or a credential error is a rejection because the request was
+		never sent. Timeouts, connection errors, 5xx, and a ``ClientError``
+		with no status are uncertain.
 		"""
 		if self._is_pre_send_validation_error(exc):
 			return True

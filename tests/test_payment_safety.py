@@ -7,8 +7,11 @@ import os
 import pytest
 from botocore.exceptions import (
 	ClientError,
+	EndpointConnectionError,
 	MissingParametersError,
+	NoCredentialsError,
 	ParamValidationError,
+	PartialCredentialsError,
 	ReadTimeoutError,
 	ValidationError,
 )
@@ -727,7 +730,7 @@ def test_send_cleanup_success_does_not_emit_the_orphan_reason():
 	class FailingSqs(FakeSqs):
 		def send_message(self, **kwargs):
 			self.send_calls.append(kwargs)
-			raise _client_error("InvalidParameterValue", status=400)
+			raise _client_error("InvalidParameterValue", status=400, retry_attempts=0)
 
 	events = []
 	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
@@ -744,7 +747,7 @@ def test_batch_send_rejection_cleanup_failure_names_the_orphan_case():
 	class FailingSqs(FakeSqs):
 		def send_message_batch(self, **kwargs):
 			self.send_batch_calls.append(kwargs)
-			raise _client_error("InvalidParameterValue", status=400)
+			raise _client_error("InvalidParameterValue", status=400, retry_attempts=0)
 
 	class CleanupFails(FakeS3):
 		def delete_object(self, **kwargs):
@@ -1051,7 +1054,7 @@ def test_definite_batch_rejection_deletes_offloaded_objects():
 	class FailingSqs(FakeSqs):
 		def send_message_batch(self, **kwargs):
 			self.send_batch_calls.append(kwargs)
-			raise _client_error("InvalidParameterValue", status=400)
+			raise _client_error("InvalidParameterValue", status=400, retry_attempts=0)
 
 	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
 	client.sqs = FailingSqs()
@@ -1308,16 +1311,20 @@ def test_client_error_without_an_integer_status_is_not_a_definite_rejection():
 	bool_status = _client_error("InternalError")
 	bool_status.response = {"ResponseMetadata": {"HTTPStatusCode": True}}
 	assert client._is_definite_sqs_rejection(bool_status) is False
-	assert client._is_definite_sqs_rejection(_client_error("InvalidParameterValue", status=400)) is True
+	assert client._is_definite_sqs_rejection(_client_error("InvalidParameterValue", status=400)) is False
 	assert client._is_definite_sqs_rejection(_client_error("InvalidParameterValue", status=400, retry_attempts=0)) is True
 	assert client._is_definite_sqs_rejection(_client_error("RequestThrottled", status=400, retry_attempts=3)) is False
 	assert client._is_definite_sqs_rejection(_client_error("InternalError", status=500)) is False
 	blank = _client_error("RequestThrottled", status=400)
 	blank.response = None
-	assert client._retry_attempts(blank) == 0
+	assert client._retry_attempts(blank) is None
 	blank = _client_error("RequestThrottled", status=400)
 	blank.response = {"ResponseMetadata": "nope"}
-	assert client._retry_attempts(blank) == 0
+	assert client._retry_attempts(blank) is None
+	blank = _client_error("RequestThrottled", status=400)
+	blank.response = {"ResponseMetadata": {"HTTPStatusCode": 400, "RetryAttempts": None}}
+	assert client._retry_attempts(blank) is None
+	assert client._is_definite_sqs_rejection(blank) is False
 	assert client._is_definite_sqs_rejection(ParamValidationError(report="DelaySeconds")) is True
 	assert client._is_definite_sqs_rejection(
 		ValidationError(value="x", param="DelaySeconds", type_name="integer")
@@ -1395,3 +1402,59 @@ def test_pre_send_validation_error_deletes_the_object():
 	cases = [fields["case"] for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
 	assert cases == [ORPHAN_AFTER_UPLOAD_SQS_REJECTED, ORPHAN_AFTER_UPLOAD_SQS_REJECTED]
 	assert ORPHAN_AFTER_SQS_UNCERTAIN not in cases
+
+
+def test_4xx_without_retry_attempts_keeps_the_object():
+	"""A 4xx is definite only when RetryAttempts is explicitly 0."""
+	error = _client_error("InvalidParameterValue", status=400)
+	assert "RetryAttempts" not in error.response["ResponseMetadata"]
+
+	class FailingSqs(FakeSqs):
+		def send_message(self, **kwargs):
+			self.send_calls.append(kwargs)
+			raise error
+
+	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
+	assert client._is_definite_sqs_rejection(error) is False
+	client.sqs = FailingSqs()
+	with pytest.raises(ClientError):
+		client.send_message(STANDARD_URL, "hello")
+	assert mock_s3.delete_calls == []
+	assert len(mock_s3.objects) == 1
+	cases = [fields["case"] for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
+	assert cases == [ORPHAN_AFTER_SQS_UNCERTAIN]
+
+
+def test_credential_error_before_send_deletes_the_object_and_connection_error_does_not():
+	class NoCreds(FakeSqs):
+		def send_message(self, **kwargs):
+			self.send_calls.append(kwargs)
+			raise NoCredentialsError()
+
+	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
+	client.sqs = NoCreds()
+	with pytest.raises(NoCredentialsError):
+		client.send_message(STANDARD_URL, "hello")
+	assert mock_s3.objects == {}
+	assert len(mock_s3.delete_calls) == 1
+	assert EVENT_S3_OBJECT_ORPHANED not in [name for name, _ in events]
+
+	assert client._is_definite_sqs_rejection(
+		PartialCredentialsError(provider="env", cred_var="aws_secret_access_key")
+	) is True
+	connection = EndpointConnectionError(endpoint_url="https://sqs.us-east-1.amazonaws.com/")
+	assert client._is_definite_sqs_rejection(connection) is False
+
+	class Unreachable(FakeSqs):
+		def send_message(self, **kwargs):
+			self.send_calls.append(kwargs)
+			raise connection
+
+	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
+	client.sqs = Unreachable()
+	with pytest.raises(EndpointConnectionError):
+		client.send_message(STANDARD_URL, "hello")
+	assert mock_s3.delete_calls == []
+	assert len(mock_s3.objects) == 1
+	cases = [fields["case"] for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
+	assert cases == [ORPHAN_AFTER_SQS_UNCERTAIN]

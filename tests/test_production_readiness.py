@@ -230,7 +230,7 @@ def test_send_failure_deletes_uploaded_payload():
 			raise ClientError(
 				{
 					"Error": {"Code": "InvalidParameterValue", "Message": "rejected"},
-					"ResponseMetadata": {"HTTPStatusCode": 400},
+					"ResponseMetadata": {"HTTPStatusCode": 400, "RetryAttempts": 0},
 				},
 				"SendMessage",
 			)
@@ -255,7 +255,7 @@ def test_send_failure_logs_orphan_when_s3_cleanup_also_fails(caplog):
 			raise ClientError(
 				{
 					"Error": {"Code": "InvalidParameterValue", "Message": "rejected"},
-					"ResponseMetadata": {"HTTPStatusCode": 400},
+					"ResponseMetadata": {"HTTPStatusCode": 400, "RetryAttempts": 0},
 				},
 				"SendMessage",
 			)
@@ -551,7 +551,7 @@ def test_send_batch_failure_deletes_offloaded_objects_and_partial_failures():
 			raise ClientError(
 				{
 					"Error": {"Code": "InvalidParameterValue", "Message": "rejected"},
-					"ResponseMetadata": {"HTTPStatusCode": 400},
+					"ResponseMetadata": {"HTTPStatusCode": 400, "RetryAttempts": 0},
 				},
 				"SendMessageBatch",
 			)
