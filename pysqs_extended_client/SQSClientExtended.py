@@ -1,4 +1,5 @@
 import base64
+import binascii
 import json
 import logging
 import os
@@ -13,7 +14,12 @@ from io import BytesIO
 import boto3
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+	ClientError,
+	MissingParametersError,
+	ParamValidationError,
+	ValidationError,
+)
 
 from pysqs_extended_client.extended_config import ExtendedClientConfiguration
 
@@ -512,7 +518,7 @@ class SQSClientExtended:
 		return ValueError(
 			"Refusing to use FIFO queue {} because its RedrivePolicy {}. "
 			"A message that cannot be read blocks its message group until it is dead-lettered. "
-			"Create a redrive policy with deadLetterTargetArn and maxReceiveCount on this queue "
+			"Create a redrive policy with deadLetterTargetArn and a maxReceiveCount of at least 1 on this queue "
 			"before sending or receiving. This library checks only this queue's policy, "
 			"creates neither the queue nor the policy, and does not emit an event.".format(
 				self._queue_name(queue_url), problem
@@ -561,11 +567,11 @@ class SQSClientExtended:
 			raise self._fifo_redrive_error(queue_url, "lacks deadLetterTargetArn")
 		if "maxReceiveCount" not in policy:
 			raise self._fifo_redrive_error(queue_url, "lacks maxReceiveCount")
-		count = self._max_receive_count(policy.get("maxReceiveCount"))
+		count, problem = self._max_receive_count(policy.get("maxReceiveCount"))
+		if problem:
+			raise self._fifo_redrive_error(queue_url, problem)
 		if count is None:
 			raise self._fifo_redrive_error(queue_url, "lacks maxReceiveCount")
-		if count < 1:
-			raise self._fifo_redrive_error(queue_url, "requires maxReceiveCount >= 1")
 
 	def _usable_pointer_target(self, message_body):
 		"""Return (bucket, key) when both are non-empty strings, else None."""
@@ -615,21 +621,42 @@ class SQSClientExtended:
 			)
 
 	def _max_receive_count(self, count):
-		"""Return a non-negative int, or None when the value is not a count.
+		"""Return ``(value, problem)``.
 
-		Booleans are rejected. ``True`` is an ``int`` in Python and must not
-		pass as ``1``. Digit strings are accepted. Zero is returned so the
-		caller can refuse it; a missing or blank value returns None.
+		``value`` is an int when the policy has an integer count. ``problem``
+		is a phrase for ``_fifo_redrive_error`` when the value is present but
+		not an integer count (a float such as ``3.0``, or an integer below 1).
+		Both are None when the count is missing or not a number. Booleans are
+		rejected. Non-ASCII digits such as ``²`` are not counts: ``str.isdigit``
+		is true for them, and ``int`` would raise.
 		"""
 		if isinstance(count, bool) or count is None:
-			return None
+			return None, None
 		if isinstance(count, int):
-			return count
+			if count < 1:
+				return count, "requires maxReceiveCount >= 1"
+			return count, None
+		if isinstance(count, float):
+			return None, self._non_integer_count_problem(count)
 		if isinstance(count, str):
 			text = count.strip()
-			if text.isdigit():
-				return int(text)
-		return None
+			if not text:
+				return None, None
+			if text.isascii() and text.isdigit():
+				value = int(text)
+				if value < 1:
+					return value, "requires maxReceiveCount >= 1"
+				return value, None
+			if text.isascii():
+				try:
+					float(text)
+				except ValueError:
+					return None, None
+				return None, self._non_integer_count_problem(text)
+		return None, None
+
+	def _non_integer_count_problem(self, count):
+		return "requires an integer maxReceiveCount of at least 1, not {!r}".format(count)
 
 	def _reject_delete_s3_before_sqs(self):
 		if not self.config.delete_s3_before_sqs:
@@ -692,12 +719,20 @@ class SQSClientExtended:
 
 		records = []
 		hydrate_jobs = []
+		errors = {}
 		for index, message in enumerate(opt_messages):
 			reserved_attribute_name = self._reserved_attribute_name_if_present(message.get("MessageAttributes", {}))
 			content_type = self._content_type_of(message)
 			if not reserved_attribute_name:
-				self._decode_inline_binary(message, content_type)
-				records.append({"kind": "inline", "message": message})
+				try:
+					self._decode_inline_binary(message, content_type)
+				except (binascii.Error, ValueError) as exc:
+					# Same deferred path as a hydrate failure: siblings still
+					# emit message_left before this error is raised.
+					errors[index] = exc
+					records.append({"kind": "pending", "index": index, "message": message})
+				else:
+					records.append({"kind": "inline", "message": message})
 				continue
 			try:
 				message_body = self._parse_s3_pointer(message.get("Body"))
@@ -738,7 +773,6 @@ class SQSClientExtended:
 			hydrate_jobs.append((index, s3_bucket_name, s3_key, as_binary, filename))
 
 		bodies = {}
-		errors = {}
 		if hydrate_jobs:
 			future_to_index = {
 				self._executor().submit(self._hydrate_from_s3, bucket, key, as_binary, filename): index
@@ -940,15 +974,42 @@ class SQSClientExtended:
 			return None
 		return status
 
+	def _retry_attempts(self, exc):
+		response = getattr(exc, "response", None)
+		if not isinstance(response, dict):
+			return 0
+		meta = response.get("ResponseMetadata")
+		if not isinstance(meta, dict):
+			return 0
+		return meta.get("RetryAttempts", 0)
+
+	def _is_pre_send_validation_error(self, exc):
+		"""True when botocore rejected the call before the request was sent.
+
+		``ParamValidationError`` is the usual case. ``ValidationError`` covers
+		alias conflicts and unknown parameters. ``MissingParametersError`` is
+		the same class of client-side check. None of these mean SQS stored
+		the message.
+		"""
+		return isinstance(exc, (ParamValidationError, ValidationError, MissingParametersError))
+
 	def _is_definite_sqs_rejection(self, exc):
 		"""True only when SQS definitely refused the send.
 
-		A botocore ``ClientError`` whose HTTP status is 4xx is a rejection.
-		Timeouts, connection errors, 5xx, and a ``ClientError`` with no status
-		are uncertain: SQS may already have stored the message.
+		A botocore ``ClientError`` whose HTTP status is 4xx is a rejection
+		only when ``RetryAttempts`` is 0. boto3 retries a timeout, then a
+		later 400 ``RequestThrottled`` can report ``RetryAttempts`` greater
+		than 0: the first attempt may already be stored. That case is
+		uncertain. A client-side validation error is a rejection because the
+		request was never sent. Timeouts, connection errors, 5xx, and a
+		``ClientError`` with no status are uncertain.
 		"""
+		if self._is_pre_send_validation_error(exc):
+			return True
 		status = self._client_error_status(exc)
-		return status is not None and 400 <= status <= 499
+		if status is None or not (400 <= status <= 499):
+			return False
+		return self._retry_attempts(exc) == 0
 
 	def _retain_uncertain_upload(self, body):
 		"""Keep an uploaded object when the send may already have been stored."""

@@ -1,10 +1,17 @@
 """Payment-safe receive, FIFO, and redrive checks from the 0.5.0 spec."""
 import base64
+import binascii
 import json
 import os
 
 import pytest
-from botocore.exceptions import ClientError, ReadTimeoutError
+from botocore.exceptions import (
+	ClientError,
+	MissingParametersError,
+	ParamValidationError,
+	ReadTimeoutError,
+	ValidationError,
+)
 
 from pysqs_extended_client.SQSClientExtended import (
 	EVENT_MESSAGE_LEFT,
@@ -55,10 +62,15 @@ def _pointer_message(bucket="test-bucket", key="missing-key", receipt="orig-hand
 	}
 
 
-def _client_error(code, status=None):
+def _client_error(code, status=None, retry_attempts=None):
 	response = {"Error": {"Code": code, "Message": code}}
+	meta = {}
 	if status is not None:
-		response["ResponseMetadata"] = {"HTTPStatusCode": status}
+		meta["HTTPStatusCode"] = status
+	if retry_attempts is not None:
+		meta["RetryAttempts"] = retry_attempts
+	if meta:
+		response["ResponseMetadata"] = meta
 	return ClientError(response, "GetObject")
 
 
@@ -527,6 +539,34 @@ def test_standard_queue_offload_does_not_read_redrive_policy():
 			})},
 			"requires maxReceiveCount >= 1",
 		),
+		(
+			{"RedrivePolicy": json.dumps({
+				"deadLetterTargetArn": DLQ_ARN,
+				"maxReceiveCount": "3.0",
+			})},
+			"integer maxReceiveCount of at least 1",
+		),
+		(
+			{"RedrivePolicy": json.dumps({
+				"deadLetterTargetArn": DLQ_ARN,
+				"maxReceiveCount": 3.0,
+			})},
+			"integer maxReceiveCount of at least 1",
+		),
+		(
+			{"RedrivePolicy": json.dumps({
+				"deadLetterTargetArn": DLQ_ARN,
+				"maxReceiveCount": "²",
+			})},
+			"lacks maxReceiveCount",
+		),
+		(
+			{"RedrivePolicy": json.dumps({
+				"deadLetterTargetArn": DLQ_ARN,
+				"maxReceiveCount": "nope",
+			})},
+			"lacks maxReceiveCount",
+		),
 	],
 )
 def test_fifo_send_and_receive_refuse_a_bad_redrive_policy(attributes, match):
@@ -612,8 +652,9 @@ def test_parsed_redrive_policy_dict_and_numeric_count_are_accepted():
 	mock_sqs.queue_attributes = {
 		"RedrivePolicy": {"deadLetterTargetArn": DLQ_ARN, "maxReceiveCount": 0},
 	}
-	with pytest.raises(ValueError, match="requires maxReceiveCount >= 1"):
+	with pytest.raises(ValueError, match="requires maxReceiveCount >= 1") as caught:
 		client.send_message(FIFO_URL, "inline", message_group_id="g")
+	assert "maxReceiveCount of at least 1" in str(caught.value)
 	assert mock_sqs.send_calls == []
 	assert mock_s3.put_calls == []
 
@@ -905,6 +946,73 @@ def test_mixed_batch_emits_message_left_for_not_found_in_either_order(keys, tmp_
 	assert mock_sqs.delete_calls == []
 	assert mock_sqs.visibility_calls == []
 	assert list(tmp_path.iterdir()) == []
+
+
+def _broken_pointer_message(receipt="broken-handle"):
+	return {
+		"Body": json.dumps([
+			PAYLOAD_S3_POINTER_CLASS,
+			{"s3BucketName": "test-bucket"},
+		]),
+		"ReceiptHandle": receipt,
+		"MessageAttributes": {
+			"SQSLargePayloadSize": {"StringValue": "4", "DataType": "Number"},
+		},
+	}
+
+
+def _bad_inline_binary_message(receipt="bad-inline"):
+	return {
+		"Body": "abc",
+		"ReceiptHandle": receipt,
+		"MessageAttributes": {
+			"SQSExtendedContentType": {"StringValue": "binary-b64", "DataType": "String"},
+		},
+	}
+
+
+@pytest.mark.parametrize("other_last", [False, True])
+def test_broken_pointer_still_emits_when_another_message_errors(other_last):
+	client, mock_sqs, _mock_s3, events = _events_of()
+
+	def hydrate(_bucket, key, as_binary=False, filename=None):
+		raise _client_error("InternalError", status=503)
+
+	client._hydrate_from_s3 = hydrate
+	broken = _broken_pointer_message()
+	other = _pointer_message(key="boom", receipt="boom-handle")
+	mock_sqs.receive_response = {
+		"Messages": [broken, other] if other_last else [other, broken]
+	}
+	with pytest.raises(ClientError) as caught:
+		client.receive_message(STANDARD_URL)
+	assert caught.value.response["ResponseMetadata"]["HTTPStatusCode"] == 503
+	left = [fields for name, fields in events if name == EVENT_MESSAGE_LEFT]
+	assert len(left) == 1
+	assert left[0]["cause"] == MESSAGE_LEFT_BROKEN_POINTER
+	assert mock_sqs.delete_calls == []
+	assert mock_sqs.visibility_calls == []
+
+
+@pytest.mark.parametrize("bad_inline_last", [False, True])
+def test_bad_inline_binary_does_not_drop_sibling_message_left_events(bad_inline_last):
+	client, mock_sqs, _mock_s3, events = _events_of()
+
+	def hydrate(_bucket, key, as_binary=False, filename=None):
+		raise _client_error("NoSuchKey", status=404)
+
+	client._hydrate_from_s3 = hydrate
+	broken = _broken_pointer_message()
+	missing = _pointer_message(key="missing", receipt="missing-handle")
+	bad = _bad_inline_binary_message()
+	ordered = [broken, missing, bad] if bad_inline_last else [bad, broken, missing]
+	mock_sqs.receive_response = {"Messages": ordered}
+	with pytest.raises(binascii.Error):
+		client.receive_message(STANDARD_URL)
+	causes = [fields["cause"] for name, fields in events if name == EVENT_MESSAGE_LEFT]
+	assert causes == [MESSAGE_LEFT_BROKEN_POINTER, MESSAGE_LEFT_S3_NOT_FOUND]
+	assert mock_sqs.delete_calls == []
+	assert mock_sqs.visibility_calls == []
 
 
 @pytest.mark.parametrize(
@@ -1201,4 +1309,89 @@ def test_client_error_without_an_integer_status_is_not_a_definite_rejection():
 	bool_status.response = {"ResponseMetadata": {"HTTPStatusCode": True}}
 	assert client._is_definite_sqs_rejection(bool_status) is False
 	assert client._is_definite_sqs_rejection(_client_error("InvalidParameterValue", status=400)) is True
+	assert client._is_definite_sqs_rejection(_client_error("InvalidParameterValue", status=400, retry_attempts=0)) is True
+	assert client._is_definite_sqs_rejection(_client_error("RequestThrottled", status=400, retry_attempts=3)) is False
 	assert client._is_definite_sqs_rejection(_client_error("InternalError", status=500)) is False
+	blank = _client_error("RequestThrottled", status=400)
+	blank.response = None
+	assert client._retry_attempts(blank) == 0
+	blank = _client_error("RequestThrottled", status=400)
+	blank.response = {"ResponseMetadata": "nope"}
+	assert client._retry_attempts(blank) == 0
+	assert client._is_definite_sqs_rejection(ParamValidationError(report="DelaySeconds")) is True
+	assert client._is_definite_sqs_rejection(
+		ValidationError(value="x", param="DelaySeconds", type_name="integer")
+	) is True
+	assert client._is_definite_sqs_rejection(
+		MissingParametersError(object_name="SendMessage", missing=["QueueUrl"])
+	) is True
+
+
+def test_retried_400_keeps_the_object_on_send_and_batch():
+	error = _client_error("RequestThrottled", status=400, retry_attempts=3)
+
+	class FailingSqs(FakeSqs):
+		def send_message(self, **kwargs):
+			self.send_calls.append(kwargs)
+			raise error
+
+		def send_message_batch(self, **kwargs):
+			self.send_batch_calls.append(kwargs)
+			raise error
+
+	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
+	client.sqs = FailingSqs()
+	with pytest.raises(ClientError):
+		client.send_message(STANDARD_URL, "hello")
+	with pytest.raises(ClientError):
+		client.send_message_batch(
+			STANDARD_URL,
+			[{"Id": "1", "MessageBody": "one"}, {"Id": "2", "MessageBody": "two"}],
+		)
+	assert mock_s3.delete_calls == []
+	assert len(mock_s3.objects) == 3
+	cases = [fields["case"] for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
+	assert cases == [
+		ORPHAN_AFTER_SQS_UNCERTAIN,
+		ORPHAN_AFTER_SQS_UNCERTAIN,
+		ORPHAN_AFTER_SQS_UNCERTAIN,
+	]
+	assert EVENT_MESSAGE_LEFT not in [name for name, _ in events]
+
+
+def test_pre_send_validation_error_deletes_the_object():
+	class RejectingSqs(FakeSqs):
+		def send_message(self, **kwargs):
+			self.send_calls.append(kwargs)
+			raise ParamValidationError(report="DelaySeconds must be an integer")
+
+		def send_message_batch(self, **kwargs):
+			self.send_batch_calls.append(kwargs)
+			raise ValidationError(value="x", param="DelaySeconds", type_name="integer")
+
+	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
+	client.sqs = RejectingSqs()
+	with pytest.raises(ParamValidationError):
+		client.send_message(STANDARD_URL, "hello")
+	assert mock_s3.objects == {}
+	assert len(mock_s3.delete_calls) == 1
+	assert EVENT_S3_OBJECT_ORPHANED not in [name for name, _ in events]
+
+	class CleanupFails(FakeS3):
+		def delete_object(self, **kwargs):
+			self.delete_calls.append(kwargs)
+			raise RuntimeError("cleanup down")
+
+	client, _mock_sqs, _mock_s3, events = _events_of(always_through_s3=True)
+	failing_s3 = CleanupFails()
+	client.sqs = RejectingSqs()
+	client.s3 = failing_s3
+	with pytest.raises(ValidationError):
+		client.send_message_batch(
+			STANDARD_URL,
+			[{"Id": "1", "MessageBody": "one"}, {"Id": "2", "MessageBody": "two"}],
+		)
+	assert len(failing_s3.delete_calls) == 2
+	cases = [fields["case"] for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
+	assert cases == [ORPHAN_AFTER_UPLOAD_SQS_REJECTED, ORPHAN_AFTER_UPLOAD_SQS_REJECTED]
+	assert ORPHAN_AFTER_SQS_UNCERTAIN not in cases

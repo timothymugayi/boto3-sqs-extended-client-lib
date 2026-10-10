@@ -218,9 +218,9 @@ Receipt-handle markers stay compatible with Java either way, so a Java producer 
 
 `purge_queue` clears SQS only. S3 objects are left behind.
 
-If `send_message` uploads to S3 and SQS definitely rejects the send, the client tries to delete that object. A definite rejection is a botocore `ClientError` with an HTTP 4xx status, or a batch `Failed` entry with `SenderFault` true. That cleanup is best-effort. If it fails, `on_event` is called as `s3_object_orphaned` with `case=after_upload_sqs_rejected`. The same delete runs for S3 objects uploaded in a batch whose offload fails before any send.
+If `send_message` uploads to S3 and SQS definitely rejects the send, the client tries to delete that object. A definite rejection is a botocore `ClientError` with an HTTP 4xx status and `RetryAttempts` of 0, a client-side validation error raised before the request is sent (`ParamValidationError` and the same class of check), or a batch `Failed` entry with `SenderFault` true. That cleanup is best-effort. If it fails, `on_event` is called as `s3_object_orphaned` with `case=after_upload_sqs_rejected`. The same delete runs for S3 objects uploaded in a batch whose offload fails before any send.
 
-A timeout, a connection error, an HTTP 5xx, or a batch `Failed` entry without `SenderFault` true is not a definite rejection. SQS may already have stored the message. The object is left for the lifecycle rule, `on_event` is called as `s3_object_orphaned` with `case=after_sqs_uncertain`, and a raised send error is re-raised. An object is also left behind if the process dies between the S3 put and the SQS send, or if `purge_queue` is used.
+A timeout, a connection error, an HTTP 5xx, a 4xx whose `RetryAttempts` is greater than 0, or a batch `Failed` entry without `SenderFault` true is not a definite rejection. boto3 retries timeouts, and the error the caller sees can be a throttled 400 after SQS already stored the first attempt. The object is left for the lifecycle rule, `on_event` is called as `s3_object_orphaned` with `case=after_sqs_uncertain`, and a raised send error is re-raised. An object is also left behind if the process dies between the S3 put and the SQS send, or if `purge_queue` is used.
 
 A confirmed missing object, a pointer missing `s3BucketName` or `s3Key`, or a size-attribute body that is not valid JSON does not delete the SQS message. `on_event` is `message_left`. A successful offload, hydrate, or delete does not use `message_left` or `s3_object_orphaned`. The FIFO deduplication raise and the redrive raise emit nothing: both happen before any upload. An exception raised inside `on_event` is logged and ignored.
 
@@ -242,7 +242,7 @@ Put a lifecycle rule on the payload prefix so leftovers expire. Abort incomplete
 
 Prefer one role for producers and one for consumers. Scope S3 to the payload prefix. Add the KMS statements only when `server_side_encryption` is a KMS strategy. `sqs:GetQueueAttributes` is required in 0.5.0 for FIFO send, batch send, and receive. A least-privilege FIFO producer that previously only allowed `sqs:SendMessage` must add it or those calls fail closed.
 
-Producer (send):
+Producer (send). `s3:DeleteObject` is what delete-on-rejection uses. Without it, a definite SQS rejection cannot remove the object that was just uploaded.
 
 ```json
 {
@@ -255,7 +255,7 @@ Producer (send):
     },
     {
       "Effect": "Allow",
-      "Action": ["s3:PutObject"],
+      "Action": ["s3:PutObject", "s3:DeleteObject"],
       "Resource": "arn:aws:s3:::my-payload-bucket/payloads/*"
     },
     {
@@ -267,7 +267,7 @@ Producer (send):
 }
 ```
 
-Consumer (receive, delete, visibility). `s3:DeleteObject` is required only when `cleanup_s3_payload` is true.
+Consumer (receive, delete, visibility). `s3:DeleteObject` is required only when `cleanup_s3_payload` is true. `s3:ListBucket` has to be on the bucket and limited to the payload prefix. Without it, S3 answers `GetObject` for a missing key with 403 instead of 404, so the not-found check never matches and `message_left` never fires.
 
 ```json
 {
@@ -282,6 +282,12 @@ Consumer (receive, delete, visibility). `s3:DeleteObject` is required only when 
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:DeleteObject"],
       "Resource": "arn:aws:s3:::my-payload-bucket/payloads/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::my-payload-bucket",
+      "Condition": {"StringLike": {"s3:prefix": ["payloads/*"]}}
     },
     {
       "Effect": "Allow",
