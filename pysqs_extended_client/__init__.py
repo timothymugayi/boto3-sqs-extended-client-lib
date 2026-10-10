@@ -11,7 +11,7 @@ from pysqs_extended_client.server_side_encryption import (
 )
 
 __title__ = "pysqs_client_extended"
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 __all__ = [
 	"SQSClientExtended",

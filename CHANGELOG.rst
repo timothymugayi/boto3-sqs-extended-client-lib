@@ -1,6 +1,27 @@
 Changelog
 =========
 
+0.5.0
+-----
+
+Breaking release. A confirmed missing payload stays on the queue, FIFO
+offload requires a caller-supplied deduplication id, and a FIFO queue
+without a redrive policy is refused. This does not make the library
+production ready on its own. The bucket lifecycle rule must be longer
+than the sum of the source-queue retention and the dead-letter
+retention. The dead-letter queue must be FIFO. This library must be the
+only receiver and only deleter. ``sqs:GetQueueAttributes`` is a new IAM permission and is
+breaking for least-privilege FIFO producers. An idempotent handler
+still has to be in place outside this package.
+
+* **Reverses 0.4.1.** A confirmed S3 not-found (``NoSuchKey``, ``404``, or ``NotFound``) no longer deletes the SQS message, including when ``ignore_payload_not_found`` is set. That flag does not delete. The ``payload_missing_deleted`` callback is gone. The message stays in the queue and, if ``on_event`` is set, the callback is ``message_left`` with ``cause=s3_not_found``. The receipt handle is not returned to the caller. A timeout or an HTTP 5xx raises, does not delete, emits nothing for itself, and is not treated as not-found. The receive is not undone. The whole batch is classified first: every not-found and every broken pointer still emits ``message_left``, and payload files for messages that will not be returned are removed, before the first other error is raised.
+* **Reverses 0.4.1.** ``delete_s3_before_sqs=True`` no longer logs a warning and no longer deletes S3 first. ``SQSClientExtended`` raises ``ValueError`` at construction. There is no dead-pointer path and no event for this raise.
+* A pointer that is missing ``s3BucketName`` or ``s3Key``, or has an empty value, is not downloaded. A body that has the size attribute but is not valid JSON is the same case. The SQS message is left in place and ``message_left`` is emitted with ``cause=broken_pointer``.
+* An inline binary body is sized as the base64 body, plus the caller's attributes, plus 38 bytes for the ``SQSExtendedContentType`` / ``String`` / ``binary-b64`` attribute. Over ``message_size_threshold`` (default 262144), the raw bytes are offloaded with content type ``binary``. Text sizing is unchanged.
+* ``message_group_id`` may be sent without ``message_deduplication_id``. On a queue whose name ends in ``.fifo``, a payload that would be offloaded without ``message_deduplication_id`` raises before any S3 upload, on ``send_message`` and on ``send_message_batch``. The batch raises before any entry is uploaded or sent. The library does not invent a deduplication id. An inline FIFO send is attempted; if SQS rejects it, that rejection is not a posted message and nothing is emitted.
+* Before ``send_message``, ``send_message_batch``, and ``receive_message`` on a ``.fifo`` queue, the client reads ``RedrivePolicy`` with ``GetQueueAttributes``. It raises if the call fails, the policy is missing or empty, or it lacks ``deadLetterTargetArn`` or a ``maxReceiveCount`` of at least 1. Zero is refused. The send raise happens before any S3 upload. The receive raise happens before the receive call. The result is not cached. Nothing is emitted. The library does not create the queue or the policy, and it checks only the queue it was given. Standard queues are not checked. ``sqs:GetQueueAttributes`` is required on FIFO producers and consumers; a least-privilege producer that only had ``sqs:SendMessage`` will fail closed.
+* A failed S3 cleanup emits ``s3_object_orphaned``. ``case=after_sqs_succeeded`` means the SQS delete already succeeded. ``case=after_upload_sqs_rejected`` means the send was a definite rejection and the uploaded object could not be deleted. A definite rejection is a botocore ``ClientError`` with a 4xx status and an explicit ``RetryAttempts`` of 0, a client-side validation error raised before the request is sent (``ParamValidationError`` and the same class of check), a credential error raised before any request (``NoCredentialsError`` and the same family), or a batch ``Failed`` entry with ``SenderFault`` true. A 4xx whose ``RetryAttempts`` is missing or greater than 0 is not definite: a missing value is not zero, and boto3 may have stored the first attempt and then been throttled. ``case=after_sqs_uncertain`` means the send outcome is unknown (timeout, connection error including ``EndpointConnectionError``, 5xx, a 4xx with missing or positive ``RetryAttempts``, or a ``Failed`` entry without ``SenderFault`` true): the object is kept for the lifecycle rule and is not deleted. A successful offload, hydrate, or delete does not use ``message_left`` or ``s3_object_orphaned``. The FIFO dedup raise and the redrive raise emit nothing. An exception raised inside ``on_event`` is logged and ignored. It does not drop the rest of the batch and it does not fail a delete that SQS already accepted. A bad inline ``binary-b64`` body is an other error: sibling ``message_left`` events are still emitted before it is raised.
+
 0.4.1
 -----
 

@@ -124,6 +124,8 @@ def test_on_event_emits_offload_metrics():
 	client.send_message("https://sqs.example/queue", "hello")
 	names = [name for name, _ in events]
 	assert "s3_offload" in names
+	assert "message_left" not in names
+	assert "s3_object_orphaned" not in names
 	offload = dict(events)["s3_offload"]
 	assert offload["bytes"] == 5
 	assert "s3_key" in offload

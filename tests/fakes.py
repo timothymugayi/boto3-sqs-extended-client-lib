@@ -107,6 +107,9 @@ class FakeSqs:
 		self.purge_calls = []
 		self.create_queue_calls = []
 		self.get_queue_url_calls = []
+		self.get_queue_attribute_calls = []
+		self.queue_attributes = {}
+		self.get_queue_attributes_error = None
 
 	def send_message(self, **kwargs):
 		self.send_calls.append(kwargs)
@@ -148,6 +151,12 @@ class FakeSqs:
 	def get_queue_url(self, **kwargs):
 		self.get_queue_url_calls.append(kwargs)
 		return {"QueueUrl": "https://sqs.example/" + kwargs.get("QueueName", "q")}
+
+	def get_queue_attributes(self, **kwargs):
+		self.get_queue_attribute_calls.append(kwargs)
+		if self.get_queue_attributes_error is not None:
+			raise self.get_queue_attributes_error
+		return {"Attributes": dict(self.queue_attributes)}
 
 
 def make_client(**config_kwargs):

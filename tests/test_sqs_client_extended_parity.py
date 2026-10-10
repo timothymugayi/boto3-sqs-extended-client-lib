@@ -285,7 +285,7 @@ def test_delete_skips_s3_when_cleanup_disabled():
 	assert mock_sqs.delete_calls[0]["ReceiptHandle"] == "orig-handle"
 
 
-def test_receive_drops_message_when_payload_missing_and_ignore_enabled():
+def test_receive_leaves_message_when_payload_missing_and_ignore_enabled():
 	client, mock_sqs, _ = _client(ignore_payload_not_found=True)
 	pointer = json.dumps([
 		PAYLOAD_S3_POINTER_CLASS,
@@ -302,7 +302,8 @@ def test_receive_drops_message_when_payload_missing_and_ignore_enabled():
 	}
 	messages = client.receive_message("https://sqs.example/queue")
 	assert messages == []
-	assert mock_sqs.delete_calls[0]["ReceiptHandle"] == "orig-handle"
+	assert mock_sqs.delete_calls == []
+	assert mock_sqs.visibility_calls == []
 
 
 def test_send_forwards_delay_seconds():
