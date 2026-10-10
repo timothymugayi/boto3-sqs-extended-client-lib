@@ -1,6 +1,6 @@
 # Java compatibility
 
-The **Amazon SQS Extended Client Library for Python** (version **0.5.0**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit) and puts a pointer on the queue.
+Pointer format and the rules for sharing a queue with the [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). Install and the current version are in the [README](../README.md).
 
 [README](../README.md) · [Configuration](configuration.md) · [IAM](iam.md) · [FIFO and redrive](fifo-and-redrive.md) · [Events](events.md) · [Binary and files](binary-and-files.md) · Java compatibility · [Migration](migration.md) · [Testing](testing.md)
 
@@ -52,10 +52,4 @@ SQS still has a 256 KB **message** limit; only the payload bytes go to S3. The d
 
 ### Server-side encryption
 
-`server_side_encryption` is the analog of Java `ServerSideEncryptionStrategy`. It must be one of the strategies below (or omitted). Other objects raise `TypeError` when the config is created. It is merged into S3 `ExtraArgs` next to `s3_canned_acl`:
-
-* `aws_managed_cmk()` — SSE-KMS with the AWS-managed `aws/s3` key (`ServerSideEncryption=aws:kms`), same as Java `AwsManagedCmk`.
-* `customer_key("alias/my-key")` or a key id — SSE-KMS with that CMK, same as Java `CustomerKey`.
-* `sse_s3()` — SSE-S3 (`AES256`). The Java factory does not expose this; it is here because boto3 callers use it.
-
-Downloads of SSE-KMS objects use the caller's IAM `kms:Decrypt`. The client does not implement customer-provided keys (SSE-C).
+`server_side_encryption` is the analog of Java `ServerSideEncryptionStrategy`. `aws_managed_cmk()` matches Java `AwsManagedCmk`, and `customer_key(...)` matches Java `CustomerKey`. The strategies, the `TypeError` for anything else, and the SSE-C limitation are in [Server-side encryption](configuration.md#server-side-encryption).

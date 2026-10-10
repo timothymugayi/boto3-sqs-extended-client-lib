@@ -141,6 +141,6 @@ S3-aware methods: `send_message`, `send_file`, `send_message_batch`, `receive_me
 
 Other SQS calls (`create_queue`, `get_queue_url`, `list_queues`, `tag_queue`, …) are forwarded to the underlying boto3 SQS client, so this wrapper can be the only SQS object you hold. Extra boto3 fields such as `DelaySeconds` and `VisibilityTimeout` are accepted on send/receive.
 
-Call `sqs.close()` when the process is shutting down to stop the bounded S3 thread pool. This is not a `boto3.resource("sqs")` replacement.
+Call `sqs.close()` when the process is shutting down to stop the bounded S3 thread pool. A send after `close()` starts a new S3 thread pool. `close()` does not turn off send-safety. It does not unregister the before-send handler and does not clear the attempt counter, so a send started after `close()`, and a send already in flight when `close()` runs, still records `before-send` and still leaves the S3 object in place when the outcome is uncertain. One handler is registered per SQS client and stays registered for that SQS client's lifetime. This is not a `boto3.resource("sqs")` replacement.
 
 Send and receive of large bodies, FIFO deduplication, and redrive checks are in [Binary and files](binary-and-files.md), [FIFO and redrive](fifo-and-redrive.md), and [Events](events.md).

@@ -1,6 +1,11 @@
 Changelog
 =========
 
+0.5.1
+-----
+
+* A credential refresh that fails during a boto3 retry is not a definite SQS rejection. botocore re-signs, and may refresh credentials, before every retry, and the refresh callback can raise any exception after attempt 1 already reached SQS, including ``NoCredentialsError`` and ``ParamValidationError``. The client records ``before-send.sqs.SendMessage`` and ``before-send.sqs.SendMessageBatch`` on a per-thread counter that is reset before each send. A non-``ClientError`` deletes the uploaded object only when that counter is still zero. When ``before-send`` already ran, the object is kept, ``s3_object_orphaned`` is emitted with ``case=after_sqs_uncertain``, and the error is re-raised. An injected client that is not a botocore client keeps the previous type check: ``ParamValidationError``, ``ValidationError``, ``MissingParametersError``, ``NoCredentialsError``, and ``UnknownCredentialError`` are definite, and other non-``ClientError`` failures (including ``ReadTimeoutError`` and connection errors) are uncertain. A mock whose ``register`` does not run the handler is in that group. One before-send handler is registered per shared SQS client. It does not reference the extended client, and it stays registered for that SQS client's lifetime. ``close()`` stops the S3 thread pool and does not remove the handler or the attempt tracker, so a send after ``close()`` and a send already in flight stay protected. Creating an extended client per request on one SQS client does not retain those instances. An SQS client that defines ``__eq__`` and is therefore unhashable still gets that handler. A 4xx ``ClientError`` is a definite rejection only when its operation is ``SendMessage`` or ``SendMessageBatch`` and ``RetryAttempts`` is explicitly 0. A 4xx from another operation, such as STS ``AssumeRole`` during a refresh, is uncertain, so the object is kept.
+
 0.5.0
 -----
 

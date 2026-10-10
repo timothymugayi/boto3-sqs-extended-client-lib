@@ -7,23 +7,24 @@ import pathlib
 import threading
 import time
 import uuid
+import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 from io import BytesIO
 
 import boto3
 from boto3.s3.transfer import TransferConfig
+from botocore.client import BaseClient
 from botocore.config import Config
 from botocore.exceptions import (
 	ClientError,
-	CredentialRetrievalError,
 	MissingParametersError,
 	NoCredentialsError,
 	ParamValidationError,
-	PartialCredentialsError,
 	UnknownCredentialError,
 	ValidationError,
 )
+from botocore.hooks import BaseEventHooks
 
 from pysqs_extended_client.extended_config import ExtendedClientConfiguration
 
@@ -88,6 +89,79 @@ ORPHAN_AFTER_SQS_SUCCEEDED = "after_sqs_succeeded"
 ORPHAN_AFTER_UPLOAD_SQS_REJECTED = "after_upload_sqs_rejected"
 ORPHAN_AFTER_SQS_UNCERTAIN = "after_sqs_uncertain"
 _CONFIRMED_S3_NOT_FOUND_CODES = frozenset(("NoSuchKey", "404", "NotFound"))
+_SQS_SEND_ATTEMPT_EVENTS = frozenset((
+	"before-send.sqs.SendMessage",
+	"before-send.sqs.SendMessageBatch",
+))
+_SQS_SEND_ATTEMPT_HOOK_PREFIX = "pysqs-extended-client-before-send"
+# id(sqs client) -> tracker. A weakref drops the entry when that client is
+# collected. id() is used so a BaseClient that defines __eq__ and is therefore
+# unhashable still gets a handler. The handler holds the tracker, not an
+# extended client, and it is not removed by close().
+_SEND_ATTEMPT_TRACKERS = {}
+_SEND_ATTEMPT_REFS = {}
+# RLock: a cyclic SQS client can be collected on this thread while _tracker_for
+# holds the lock. The finalizer only removes its own weakref, so re-entry is safe.
+_SEND_ATTEMPT_TRACKERS_LOCK = threading.RLock()
+
+
+class _SendAttemptTracker:
+	"""Thread-local before-send count shared by every wrapper of one SQS client."""
+
+	def __init__(self):
+		self._local = threading.local()
+		self.lock = threading.Lock()
+		self.registered = False
+
+	def reset(self):
+		self._local.count = 0
+
+	def note(self, event_name=None, **kwargs):
+		if event_name not in _SQS_SEND_ATTEMPT_EVENTS:
+			return
+		self._local.count = getattr(self._local, "count", 0) + 1
+
+	def was_attempted(self):
+		return getattr(self._local, "count", 0) > 0
+
+	def count(self):
+		return getattr(self._local, "count", 0)
+
+
+def _forget_send_attempt_tracker(dead_ref, client_id):
+	with _SEND_ATTEMPT_TRACKERS_LOCK:
+		if _SEND_ATTEMPT_REFS.get(client_id) is dead_ref:
+			_SEND_ATTEMPT_TRACKERS.pop(client_id, None)
+			_SEND_ATTEMPT_REFS.pop(client_id, None)
+
+
+def _live_sqs_events(sqs):
+	"""Return botocore event hooks only when before-send will actually run.
+
+	A ``MagicMock`` has a callable ``register`` that never emits. Treating that
+	as a live hook leaves the attempt count at 0, so a timeout looks like a
+	definite rejection and the uploaded object is deleted.
+	"""
+	events = getattr(getattr(sqs, "meta", None), "events", None)
+	if isinstance(sqs, BaseClient) and isinstance(events, BaseEventHooks):
+		return events
+	return None
+
+
+def _tracker_for(sqs):
+	with _SEND_ATTEMPT_TRACKERS_LOCK:
+		client_id = id(sqs)
+		ref = _SEND_ATTEMPT_REFS.get(client_id)
+		tracker = _SEND_ATTEMPT_TRACKERS.get(client_id)
+		if tracker is not None and ref is not None and ref() is sqs:
+			return tracker
+		tracker = _SendAttemptTracker()
+		_SEND_ATTEMPT_REFS[client_id] = weakref.ref(
+			sqs,
+			lambda dead, client_id=client_id: _forget_send_attempt_tracker(dead, client_id),
+		)
+		_SEND_ATTEMPT_TRACKERS[client_id] = tracker
+		return tracker
 
 
 class SQSClientExtended:
@@ -136,6 +210,11 @@ class SQSClientExtended:
 		)
 		self._pool = None
 		self._pool_lock = threading.Lock()
+		# Shared with every extended client on this botocore SQS client.
+		# boto3 retries on the calling thread; the count itself is thread-local.
+		self._send_attempt_tracker = None
+		self._sqs_attempt_hook_registered = False
+		self._register_sqs_send_attempt_hook()
 		self._reject_delete_s3_before_sqs()
 		self.config.freeze()
 
@@ -242,6 +321,13 @@ class SQSClientExtended:
 			)
 
 	def close(self):
+		"""Stop the S3 thread pool.
+
+		Does not unregister the before-send handler and does not clear this
+		instance's tracker. A send after ``close()``, and a send already in
+		flight, still records ``before-send``. The handler stays registered
+		for the SQS client's lifetime.
+		"""
 		with self._pool_lock:
 			pool = self._pool
 			self._pool = None
@@ -995,45 +1081,107 @@ class SQSClientExtended:
 			return None
 		return attempts
 
-	def _is_pre_send_validation_error(self, exc):
-		"""True when botocore rejected the call before the request was sent.
+	def _register_sqs_send_attempt_hook(self):
+		"""Record before-send once per botocore SQS client.
 
-		``ParamValidationError`` is the usual case. ``ValidationError`` covers
-		alias conflicts and unknown parameters. ``MissingParametersError`` is
-		the same class of client-side check. Credential errors
-		(``NoCredentialsError`` and the same family) are raised while resolving
-		credentials, also before any request. ``EndpointConnectionError`` is
-		not in this set: the request may already have been sent. None of the
-		included errors mean SQS stored the message.
+		botocore emits ``before-send`` after signing and immediately before the
+		HTTP attempt. A refresh callback runs during the re-sign of a retry,
+		which is before that attempt's ``before-send`` and after attempt 1
+		already emitted it. The callback can raise any exception.
+
+		The handler is the tracker's ``note`` method. It does not reference
+		this extended client. One ``unique_id`` per SQS client means another
+		wrapper does not add a handler. ``close()`` leaves the handler in
+		place. Injected clients that are not botocore clients keep the
+		type-based fallback.
+		"""
+		if self._sqs_attempt_hook_registered:
+			return
+		events = _live_sqs_events(self.sqs)
+		if events is None:
+			return
+		tracker = _tracker_for(self.sqs)
+		with tracker.lock:
+			if not tracker.registered:
+				events.register(
+					"before-send.sqs",
+					tracker.note,
+					unique_id=_SQS_SEND_ATTEMPT_HOOK_PREFIX,
+				)
+				tracker.registered = True
+		self._send_attempt_tracker = tracker
+		self._sqs_attempt_hook_registered = True
+
+	def _reset_sqs_send_attempts(self):
+		tracker = self._send_attempt_tracker
+		if tracker is not None:
+			tracker.reset()
+
+	def _sqs_send_was_attempted(self):
+		tracker = self._send_attempt_tracker
+		if tracker is None:
+			return False
+		return tracker.was_attempted()
+
+	def _sqs_send_attempt_count(self):
+		tracker = self._send_attempt_tracker
+		if tracker is None:
+			return 0
+		return tracker.count()
+
+	def _is_pre_send_validation_error(self, exc):
+		"""Fallback when the SQS client has no before-send events.
+
+		Used for injected clients that are not botocore clients. These types
+		are the ones botocore raises while validating parameters or resolving
+		a missing credential provider, which is before an HTTP attempt on a
+		real client. A refresh callback can raise the same types after an
+		attempt was already sent; that case is decided by ``before-send``.
 		"""
 		return isinstance(exc, (
 			ParamValidationError,
 			ValidationError,
 			MissingParametersError,
 			NoCredentialsError,
-			PartialCredentialsError,
-			CredentialRetrievalError,
 			UnknownCredentialError,
 		))
 
+	def _is_sqs_send_operation(self, exc):
+		"""True when the error is from SendMessage or SendMessageBatch."""
+		return getattr(exc, "operation_name", None) in (
+			"SendMessage",
+			"SendMessageBatch",
+		)
+
 	def _is_definite_sqs_rejection(self, exc):
-		"""True only when SQS definitely refused the send.
+		"""True only when the send cannot already be stored in SQS.
 
 		A botocore ``ClientError`` whose HTTP status is 4xx is a rejection
-		only when ``RetryAttempts`` is explicitly 0. A missing value is not
-		zero. boto3 retries a timeout, then a later 400 ``RequestThrottled``
-		can report ``RetryAttempts`` greater than 0: the first attempt may
-		already be stored. That case is uncertain. A client-side validation
-		error or a credential error is a rejection because the request was
-		never sent. Timeouts, connection errors, 5xx, and a ``ClientError``
-		with no status are uncertain.
+		only when its operation is ``SendMessage`` or ``SendMessageBatch`` and
+		``RetryAttempts`` is explicitly 0. A missing value is not zero. A 4xx
+		from STS (for example ``AssumeRole``) during a credential refresh is
+		not an SQS rejection. boto3 retries a timeout, then a later 400
+		``RequestThrottled`` can report ``RetryAttempts`` greater than 0: the
+		first attempt may already be stored.
+
+		Any other exception is a definite rejection only when this call's
+		``before-send`` event did not run, so no HTTP attempt left the client.
+		botocore re-signs before every retry, and the refresh callback can
+		raise any type (including ``NoCredentialsError`` and
+		``ParamValidationError``) after attempt 1 was already sent. The
+		before-send count is used only for a real botocore client. A mock or
+		other wrapper uses the type-based fallback, so a timeout stays uncertain.
 		"""
-		if self._is_pre_send_validation_error(exc):
-			return True
-		status = self._client_error_status(exc)
-		if status is None or not (400 <= status <= 499):
-			return False
-		return self._retry_attempts(exc) == 0
+		if isinstance(exc, ClientError):
+			status = self._client_error_status(exc)
+			if status is None or not (400 <= status <= 499):
+				return False
+			if not self._is_sqs_send_operation(exc):
+				return False
+			return self._retry_attempts(exc) == 0
+		if self._sqs_attempt_hook_registered:
+			return not self._sqs_send_was_attempted()
+		return self._is_pre_send_validation_error(exc)
 
 	def _retain_uncertain_upload(self, body):
 		"""Keep an uploaded object when the send may already have been stored."""
@@ -1245,6 +1393,7 @@ class SQSClientExtended:
 		if message_deduplication_id:
 			params["MessageDeduplicationId"] = message_deduplication_id
 		try:
+			self._reset_sqs_send_attempts()
 			return self.sqs.send_message(**params)
 		except Exception as exc:
 			self._release_offloaded_send(
@@ -1351,6 +1500,7 @@ class SQSClientExtended:
 		params = {"QueueUrl": queue_url, "Entries": sqs_entries}
 		params.update(kwargs)
 		try:
+			self._reset_sqs_send_attempts()
 			result = self.sqs.send_message_batch(**params)
 		except Exception as exc:
 			definite = self._is_definite_sqs_rejection(exc)
