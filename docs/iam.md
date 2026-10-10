@@ -71,4 +71,4 @@ Uploads default to the bucket's Object Ownership settings (no canned ACL). Prefe
 
 If you still need a canned ACL, set `s3_canned_acl` (for example `"bucket-owner-read"` or `"bucket-owner-full-control"`). That is passed as `ExtraArgs={"ACL": ...}` on `upload_fileobj`. Buckets with Object Ownership **BucketOwnerEnforced** reject ACLs; leave `s3_canned_acl` unset in that case.
 
-FIFO `sqs:GetQueueAttributes` is covered in [Redrive policy](fifo-and-redrive.md#redrive-policy). What `message_left` does when S3 returns 403 instead of 404 is in [Events](events.md#message-left).
+FIFO `sqs:GetQueueAttributes` is covered in [Redrive policy](fifo-and-redrive.md#redrive-policy).
