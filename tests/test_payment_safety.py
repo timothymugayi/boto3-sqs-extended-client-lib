@@ -1,6 +1,7 @@
 """Payment-safe receive, FIFO, and redrive checks from the 0.5.0 spec."""
 import base64
 import json
+import os
 
 import pytest
 from botocore.exceptions import ClientError, ReadTimeoutError
@@ -12,9 +13,10 @@ from pysqs_extended_client.SQSClientExtended import (
 	MESSAGE_LEFT_BROKEN_POINTER,
 	MESSAGE_LEFT_S3_NOT_FOUND,
 	ORPHAN_AFTER_SQS_SUCCEEDED,
+	ORPHAN_AFTER_SQS_UNCERTAIN,
 	ORPHAN_AFTER_UPLOAD_SQS_REJECTED,
 )
-from tests.fakes import PAYLOAD_S3_POINTER_CLASS, FakeS3, FakeSqs, make_client
+from tests.fakes import EMBEDDED_HANDLE, PAYLOAD_S3_POINTER_CLASS, FakeS3, FakeSqs, make_client
 
 
 FIFO_URL = "https://sqs.us-east-1.amazonaws.com/123456789012/payments.fifo"
@@ -197,8 +199,8 @@ def test_broken_pointer_does_not_drop_a_readable_sibling():
 	messages = client.receive_message(STANDARD_URL)
 	assert [message["Body"] for message in messages] == ["payload"]
 	assert mock_sqs.delete_calls == []
-	assert [name for name, _ in events] == [EVENT_MESSAGE_LEFT, "s3_hydrate"]
-	assert events[0][1]["cause"] == MESSAGE_LEFT_BROKEN_POINTER
+	assert [name for name, _ in events] == ["s3_hydrate", EVENT_MESSAGE_LEFT]
+	assert events[1][1]["cause"] == MESSAGE_LEFT_BROKEN_POINTER
 
 
 @pytest.mark.parametrize("ignore", [False, True])
@@ -277,7 +279,7 @@ def test_other_s3_errors_raise_without_a_message_left_event():
 	assert events == []
 
 
-def test_invalid_pointer_json_raises_without_deleting_or_emitting():
+def test_invalid_pointer_json_is_a_broken_pointer():
 	client, mock_sqs, _mock_s3, events = _events_of()
 	mock_sqs.receive_response = {
 		"Messages": [{
@@ -288,10 +290,13 @@ def test_invalid_pointer_json_raises_without_deleting_or_emitting():
 			},
 		}]
 	}
-	with pytest.raises(ValueError, match="Decoding JSON has failed"):
-		client.receive_message(STANDARD_URL)
+	assert client.receive_message(STANDARD_URL) == []
 	assert mock_sqs.delete_calls == []
-	assert events == []
+	assert mock_sqs.visibility_calls == []
+	assert len(events) == 1
+	assert events[0][0] == EVENT_MESSAGE_LEFT
+	assert events[0][1]["cause"] == MESSAGE_LEFT_BROKEN_POINTER
+	assert events[0][1]["receipt_handle"] == "h"
 
 
 def test_group_id_alone_is_sent_for_an_inline_fifo_body():
@@ -453,8 +458,11 @@ def test_group_id_kwargs_are_forwarded_for_an_inline_send():
 def test_standard_queue_offload_does_not_read_redrive_policy():
 	client, mock_sqs, mock_s3, _events = _events_of(always_through_s3=True)
 	client.send_message(STANDARD_URL, "body", message_group_id="g")
+	client.send_message_batch(STANDARD_URL, [{"Id": "1", "MessageBody": "batch"}])
+	mock_sqs.receive_response = {"Messages": []}
+	assert client.receive_message(STANDARD_URL) == []
 	assert mock_sqs.get_queue_attribute_calls == []
-	assert len(mock_s3.put_calls) == 1
+	assert len(mock_s3.put_calls) == 2
 	assert "MessageDeduplicationId" not in mock_sqs.send_calls[0]
 
 
@@ -497,6 +505,27 @@ def test_standard_queue_offload_does_not_read_redrive_policy():
 				"maxReceiveCount": None,
 			})},
 			"lacks maxReceiveCount",
+		),
+		(
+			{"RedrivePolicy": json.dumps({
+				"deadLetterTargetArn": DLQ_ARN,
+				"maxReceiveCount": 0,
+			})},
+			"requires maxReceiveCount >= 1",
+		),
+		(
+			{"RedrivePolicy": json.dumps({
+				"deadLetterTargetArn": DLQ_ARN,
+				"maxReceiveCount": "0",
+			})},
+			"requires maxReceiveCount >= 1",
+		),
+		(
+			{"RedrivePolicy": json.dumps({
+				"deadLetterTargetArn": DLQ_ARN,
+				"maxReceiveCount": -1,
+			})},
+			"requires maxReceiveCount >= 1",
 		),
 	],
 )
@@ -583,11 +612,19 @@ def test_parsed_redrive_policy_dict_and_numeric_count_are_accepted():
 	mock_sqs.queue_attributes = {
 		"RedrivePolicy": {"deadLetterTargetArn": DLQ_ARN, "maxReceiveCount": 0},
 	}
+	with pytest.raises(ValueError, match="requires maxReceiveCount >= 1"):
+		client.send_message(FIFO_URL, "inline", message_group_id="g")
+	assert mock_sqs.send_calls == []
+	assert mock_s3.put_calls == []
+
+	mock_sqs.queue_attributes = {
+		"RedrivePolicy": {"deadLetterTargetArn": DLQ_ARN, "maxReceiveCount": 1},
+	}
 	client.send_message(FIFO_URL, "inline", message_group_id="g")
 	assert mock_sqs.send_calls
 	assert mock_s3.put_calls == []
 
-	mock_sqs.queue_attributes = {"RedrivePolicy": _policy(count=5)}
+	mock_sqs.queue_attributes = {"RedrivePolicy": _policy(count="5")}
 	client.receive_message(FIFO_URL)
 	assert mock_sqs.receive_calls
 
@@ -649,14 +686,15 @@ def test_send_cleanup_success_does_not_emit_the_orphan_reason():
 	class FailingSqs(FakeSqs):
 		def send_message(self, **kwargs):
 			self.send_calls.append(kwargs)
-			raise RuntimeError("sqs down")
+			raise _client_error("InvalidParameterValue", status=400)
 
 	events = []
 	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
 	client.sqs = FailingSqs()
-	with pytest.raises(RuntimeError, match="sqs down"):
+	with pytest.raises(ClientError):
 		client.send_message(STANDARD_URL, "hello")
 	assert mock_s3.objects == {}
+	assert len(mock_s3.delete_calls) == 1
 	assert EVENT_S3_OBJECT_ORPHANED not in [name for name, _ in events]
 	assert EVENT_MESSAGE_LEFT not in [name for name, _ in events]
 
@@ -665,7 +703,7 @@ def test_batch_send_rejection_cleanup_failure_names_the_orphan_case():
 	class FailingSqs(FakeSqs):
 		def send_message_batch(self, **kwargs):
 			self.send_batch_calls.append(kwargs)
-			raise RuntimeError("batch rejected")
+			raise _client_error("InvalidParameterValue", status=400)
 
 	class CleanupFails(FakeS3):
 		def delete_object(self, **kwargs):
@@ -677,7 +715,7 @@ def test_batch_send_rejection_cleanup_failure_names_the_orphan_case():
 	client, _mock_sqs, _mock_s3, events = _events_of(always_through_s3=True)
 	client.sqs = FailingSqs()
 	client.s3 = mock_s3
-	with pytest.raises(RuntimeError, match="batch rejected"):
+	with pytest.raises(ClientError):
 		client.send_message_batch(
 			STANDARD_URL,
 			[{"Id": "1", "MessageBody": "one"}, {"Id": "2", "MessageBody": "two"}],
@@ -693,7 +731,7 @@ def test_partial_batch_failure_orphan_is_only_the_rejected_entry():
 			self.send_batch_calls.append(kwargs)
 			return {
 				"Successful": [{"Id": "ok"}],
-				"Failed": [{"Id": "bad", "Code": "InternalError", "SenderFault": False}],
+				"Failed": [{"Id": "bad", "Code": "InvalidParameterValue", "SenderFault": True}],
 			}
 
 	class CleanupFails(FakeS3):
@@ -813,3 +851,354 @@ def test_non_string_dedup_id_is_forwarded_unchanged():
 		message_deduplication_id=12345,
 	)
 	assert mock_sqs.send_calls[0]["MessageDeduplicationId"] == 12345
+
+
+def _real_s3_404(code, operation):
+	return ClientError(
+		{
+			"Error": {
+				"Code": code,
+				"Message": "The specified key does not exist.",
+				"Key": "missing-key",
+			},
+			"ResponseMetadata": {
+				"RequestId": "4442587FB7D0A2F9",
+				"HostId": "9+host",
+				"HTTPStatusCode": 404,
+				"HTTPHeaders": {
+					"x-amz-request-id": "4442587FB7D0A2F9",
+					"x-amz-id-2": "9+host",
+					"content-type": "application/xml",
+				},
+				"RetryAttempts": 0,
+			},
+		},
+		operation,
+	)
+
+
+@pytest.mark.parametrize("keys", [("boom", "missing", "good"), ("missing", "boom", "good")])
+def test_mixed_batch_emits_message_left_for_not_found_in_either_order(keys, tmp_path):
+	client, mock_sqs, _mock_s3, events = _events_of()
+
+	def hydrate(_bucket, key, as_binary=False, filename=None):
+		if filename:
+			with open(filename, "wb") as handle:
+				handle.write(key.encode("utf-8"))
+		if key == "missing":
+			raise _client_error("NoSuchKey", status=404)
+		if key == "boom":
+			raise _client_error("InternalError", status=503)
+		return filename
+
+	client._hydrate_from_s3 = hydrate
+	mock_sqs.receive_response = {
+		"Messages": [_pointer_message(key=key, receipt="h-" + key) for key in keys]
+	}
+	with pytest.raises(ClientError) as caught:
+		client.receive_message(STANDARD_URL, payload_dir=str(tmp_path))
+	assert caught.value.response["ResponseMetadata"]["HTTPStatusCode"] == 503
+	left = [fields for name, fields in events if name == EVENT_MESSAGE_LEFT]
+	assert len(left) == 1
+	assert left[0]["cause"] == MESSAGE_LEFT_S3_NOT_FOUND
+	assert left[0]["s3_key"] == "missing"
+	assert mock_sqs.delete_calls == []
+	assert mock_sqs.visibility_calls == []
+	assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+	"raise_error",
+	[
+		lambda: ReadTimeoutError(endpoint_url="https://sqs.us-east-1.amazonaws.com/"),
+		lambda: _client_error("InternalError", status=500),
+		lambda: _client_error("InternalError", status=503),
+		lambda: ConnectionError("connection reset"),
+		lambda: _client_error("RequestTimeout"),
+	],
+)
+def test_uncertain_send_keeps_the_object_and_names_the_orphan_case(raise_error):
+	error = raise_error()
+
+	class FailingSqs(FakeSqs):
+		def send_message(self, **kwargs):
+			self.send_calls.append(kwargs)
+			raise error
+
+	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
+	client.sqs = FailingSqs()
+	with pytest.raises(type(error)):
+		client.send_message(STANDARD_URL, "hello")
+	assert mock_s3.delete_calls == []
+	assert len(mock_s3.objects) == 1
+	orphans = [fields for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
+	assert len(orphans) == 1
+	assert orphans[0]["case"] == ORPHAN_AFTER_SQS_UNCERTAIN
+	assert orphans[0]["s3_bucket_name"] == "test-bucket"
+	assert orphans[0]["s3_key"]
+	assert EVENT_MESSAGE_LEFT not in [name for name, _ in events]
+
+
+def test_definite_batch_rejection_deletes_offloaded_objects():
+	class FailingSqs(FakeSqs):
+		def send_message_batch(self, **kwargs):
+			self.send_batch_calls.append(kwargs)
+			raise _client_error("InvalidParameterValue", status=400)
+
+	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
+	client.sqs = FailingSqs()
+	with pytest.raises(ClientError):
+		client.send_message_batch(
+			STANDARD_URL,
+			[{"Id": "1", "MessageBody": "one"}, {"Id": "2", "MessageBody": "two"}],
+		)
+	assert mock_s3.objects == {}
+	assert len(mock_s3.delete_calls) == 2
+	assert EVENT_S3_OBJECT_ORPHANED not in [name for name, _ in events]
+
+
+def test_uncertain_batch_send_keeps_every_offloaded_object():
+	class FailingSqs(FakeSqs):
+		def send_message_batch(self, **kwargs):
+			self.send_batch_calls.append(kwargs)
+			raise _client_error("ServiceUnavailable", status=503)
+
+	client, _mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
+	client.sqs = FailingSqs()
+	with pytest.raises(ClientError):
+		client.send_message_batch(
+			STANDARD_URL,
+			[{"Id": "1", "MessageBody": "one"}, {"Id": "2", "MessageBody": "two"}],
+		)
+	assert mock_s3.delete_calls == []
+	assert len(mock_s3.objects) == 2
+	cases = [fields["case"] for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
+	assert cases == [ORPHAN_AFTER_SQS_UNCERTAIN, ORPHAN_AFTER_SQS_UNCERTAIN]
+	assert EVENT_MESSAGE_LEFT not in [name for name, _ in events]
+
+
+@pytest.mark.parametrize(
+	"failed_entry",
+	[
+		{"Id": "bad", "Code": "InternalError", "SenderFault": False},
+		{"Id": "bad", "Code": "InternalError"},
+	],
+)
+def test_uncertain_batch_failed_entry_keeps_the_object(failed_entry):
+	class PartialSqs(FakeSqs):
+		def send_message_batch(self, **kwargs):
+			self.send_batch_calls.append(kwargs)
+			return {"Successful": [{"Id": "ok"}], "Failed": [failed_entry]}
+
+	client, mock_sqs, mock_s3, events = _events_of(always_through_s3=True)
+	client.sqs = PartialSqs()
+	result = client.send_message_batch(
+		STANDARD_URL,
+		[{"Id": "ok", "MessageBody": "kept"}, {"Id": "bad", "MessageBody": "drop"}],
+	)
+	assert result["Failed"] == [failed_entry]
+	assert mock_s3.delete_calls == []
+	bodies = {body for body in mock_s3.objects.values()}
+	assert bodies == {b"kept", b"drop"}
+	orphans = [fields for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
+	assert len(orphans) == 1
+	assert orphans[0]["case"] == ORPHAN_AFTER_SQS_UNCERTAIN
+	kept_keys = {key for (_bucket, key), body in mock_s3.objects.items() if body == b"kept"}
+	assert orphans[0]["s3_key"] not in kept_keys
+
+
+def test_delete_message_batch_s3_failure_emits_the_orphan_event(caplog):
+	class FailingDeleteS3(FakeS3):
+		def delete_object(self, **kwargs):
+			self.delete_calls.append(kwargs)
+			raise RuntimeError("s3 down")
+
+	events = []
+	mock_sqs = FakeSqs()
+	mock_s3 = FailingDeleteS3()
+	mock_s3.objects[("test-bucket", "abc-key")] = b"payload"
+	from pysqs_extended_client import SQSClientExtended
+	from pysqs_extended_client.extended_config import ExtendedClientConfiguration
+
+	client = SQSClientExtended(
+		sqs_client=mock_sqs,
+		s3_client=mock_s3,
+		config=ExtendedClientConfiguration(
+			s3_bucket_name="test-bucket",
+			on_event=lambda name, **fields: events.append((name, fields)),
+		),
+	)
+	with caplog.at_level("WARNING"):
+		result = client.delete_message_batch(
+			STANDARD_URL,
+			[{"Id": "1", "ReceiptHandle": EMBEDDED_HANDLE}],
+		)
+	assert result["Successful"][0]["Id"] == "1"
+	assert mock_sqs.delete_batch_calls
+	orphans = [fields for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
+	assert len(orphans) == 1
+	assert orphans[0]["case"] == ORPHAN_AFTER_SQS_SUCCEEDED
+	assert orphans[0]["s3_key"] == "abc-key"
+	assert "orphaned" in caplog.text
+	assert EVENT_MESSAGE_LEFT not in [name for name, _ in events]
+
+
+def test_download_fileobj_404_leaves_the_message():
+	client, mock_sqs, mock_s3, events = _events_of()
+
+	def download_fileobj(Bucket, Key, Fileobj, ExtraArgs=None, Callback=None, Config=None):
+		raise _real_s3_404("NoSuchKey", "GetObject")
+
+	mock_s3.download_fileobj = download_fileobj
+	mock_sqs.receive_response = {"Messages": [_pointer_message()]}
+	assert client.receive_message(STANDARD_URL) == []
+	assert mock_sqs.delete_calls == []
+	assert mock_sqs.visibility_calls == []
+	assert events[0][0] == EVENT_MESSAGE_LEFT
+	assert events[0][1]["cause"] == MESSAGE_LEFT_S3_NOT_FOUND
+	assert events[0][1]["s3_key"] == "missing-key"
+
+
+def test_download_file_404_leaves_the_message_and_removes_the_partial_file(tmp_path):
+	client, mock_sqs, mock_s3, events = _events_of()
+
+	def download_file(Bucket, Key, Filename, ExtraArgs=None, Callback=None, Config=None):
+		parent = os.path.dirname(Filename)
+		if parent:
+			os.makedirs(parent, exist_ok=True)
+		with open(Filename, "wb") as handle:
+			handle.write(b"partial")
+		raise _real_s3_404("404", "HeadObject")
+
+	mock_s3.download_file = download_file
+	mock_sqs.receive_response = {"Messages": [_pointer_message()]}
+	assert client.receive_message(STANDARD_URL, payload_dir=str(tmp_path)) == []
+	assert mock_sqs.delete_calls == []
+	assert mock_sqs.visibility_calls == []
+	assert list(tmp_path.iterdir()) == []
+	assert events[0][0] == EVENT_MESSAGE_LEFT
+	assert events[0][1]["cause"] == MESSAGE_LEFT_S3_NOT_FOUND
+	assert events[0][1]["s3_key"] == "missing-key"
+
+
+def test_on_event_exception_is_logged_and_does_not_drop_siblings(caplog):
+	seen = []
+
+	def boom(name, **fields):
+		seen.append(name)
+		raise RuntimeError("callback failed")
+
+	client, mock_sqs, mock_s3 = make_client(on_event=boom)
+	mock_s3.objects[("test-bucket", "good")] = b"payload"
+	broken = {
+		"Body": "{not-json",
+		"MessageAttributes": {
+			"SQSLargePayloadSize": {"StringValue": "1", "DataType": "Number"},
+		},
+	}
+	mock_sqs.receive_response = {
+		"Messages": [
+			_pointer_message(key="good", receipt="good-handle"),
+			dict(broken, ReceiptHandle="b1"),
+			dict(broken, ReceiptHandle="b2"),
+		]
+	}
+	with caplog.at_level("ERROR"):
+		messages = client.receive_message(STANDARD_URL)
+	assert [message["Body"] for message in messages] == ["payload"]
+	assert seen == ["s3_hydrate", EVENT_MESSAGE_LEFT, EVENT_MESSAGE_LEFT]
+	assert "on_event callback raised" in caplog.text
+	assert mock_sqs.delete_calls == []
+
+
+def test_on_event_exception_after_sqs_delete_is_swallowed(caplog):
+	seen = []
+
+	def boom(name, **fields):
+		seen.append((name, fields.get("case")))
+		raise RuntimeError("callback failed")
+
+	class FailingDeleteS3(FakeS3):
+		def delete_object(self, **kwargs):
+			self.delete_calls.append(kwargs)
+			raise RuntimeError("s3 down")
+
+	mock_sqs = FakeSqs()
+	mock_s3 = FailingDeleteS3()
+	mock_s3.objects[("test-bucket", "abc-key")] = b"payload"
+	from pysqs_extended_client import SQSClientExtended
+	from pysqs_extended_client.extended_config import ExtendedClientConfiguration
+
+	client = SQSClientExtended(
+		sqs_client=mock_sqs,
+		s3_client=mock_s3,
+		config=ExtendedClientConfiguration(s3_bucket_name="test-bucket", on_event=boom),
+	)
+	with caplog.at_level("ERROR"):
+		result = client.delete_message(STANDARD_URL, EMBEDDED_HANDLE)
+	assert result == {}
+	assert mock_sqs.delete_calls[0]["ReceiptHandle"] == "orig-handle"
+	assert seen == [(EVENT_S3_OBJECT_ORPHANED, ORPHAN_AFTER_SQS_SUCCEEDED)]
+	assert "on_event callback raised" in caplog.text
+	assert mock_s3.objects[("test-bucket", "abc-key")] == b"payload"
+
+
+def test_not_found_payload_file_missing_on_disk_is_still_left(tmp_path):
+	client, mock_sqs, _mock_s3, events = _events_of()
+
+	def hydrate(*_args, **_kwargs):
+		raise _client_error("404", status=404)
+
+	client._hydrate_from_s3 = hydrate
+	mock_sqs.receive_response = {"Messages": [_pointer_message()]}
+	assert client.receive_message(STANDARD_URL, payload_dir=str(tmp_path)) == []
+	assert events[0][1]["cause"] == MESSAGE_LEFT_S3_NOT_FOUND
+	assert list(tmp_path.iterdir()) == []
+	assert mock_sqs.delete_calls == []
+
+
+def test_stuck_payload_file_is_logged_and_the_receive_error_still_raises(tmp_path, monkeypatch, caplog):
+	client, mock_sqs, _mock_s3, events = _events_of()
+
+	def hydrate(_bucket, _key, as_binary=False, filename=None):
+		if filename:
+			with open(filename, "wb") as handle:
+				handle.write(b"x")
+		raise _client_error("InternalError", status=500)
+
+	client._hydrate_from_s3 = hydrate
+	mock_sqs.receive_response = {"Messages": [_pointer_message()]}
+
+	def stuck(_path):
+		raise OSError("busy")
+
+	monkeypatch.setattr(os, "remove", stuck)
+	with caplog.at_level("WARNING"):
+		with pytest.raises(ClientError):
+			client.receive_message(STANDARD_URL, payload_dir=str(tmp_path))
+	assert "Failed to remove payload file" in caplog.text
+	assert events == []
+	assert mock_sqs.delete_calls == []
+
+
+def test_uncertain_retain_ignores_a_body_that_is_not_a_pointer():
+	client, _mock_sqs, mock_s3, events = _events_of()
+	client._retain_uncertain_upload("not-json")
+	client._retain_uncertain_upload(None)
+	assert mock_s3.delete_calls == []
+	assert events == []
+
+
+def test_client_error_without_an_integer_status_is_not_a_definite_rejection():
+	client, _mock_sqs, _mock_s3 = make_client()
+	missing = _client_error("InternalError", status=400)
+	missing.response = None
+	assert client._is_definite_sqs_rejection(missing) is False
+	text_status = _client_error("InternalError")
+	text_status.response = {"ResponseMetadata": {"HTTPStatusCode": "400"}}
+	assert client._is_definite_sqs_rejection(text_status) is False
+	bool_status = _client_error("InternalError")
+	bool_status.response = {"ResponseMetadata": {"HTTPStatusCode": True}}
+	assert client._is_definite_sqs_rejection(bool_status) is False
+	assert client._is_definite_sqs_rejection(_client_error("InvalidParameterValue", status=400)) is True
+	assert client._is_definite_sqs_rejection(_client_error("InternalError", status=500)) is False

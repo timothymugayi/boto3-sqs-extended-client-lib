@@ -83,9 +83,8 @@ class ExtendedClientConfiguration:
 		self.s3_canned_acl = s3_canned_acl
 		self.server_side_encryption = server_side_encryption
 		self.payload_support_enabled = payload_support_enabled
-		# True is refused. delete_message and delete_message_batch raise before
-		# either delete so the caller is not told the object was removed first.
-		# There is no S3-then-SQS path and no dead-pointer path.
+		# True is refused when SQSClientExtended is constructed. There is no
+		# S3-then-SQS path and no dead-pointer path.
 		self.delete_s3_before_sqs = delete_s3_before_sqs
 		self.on_event = on_event
 

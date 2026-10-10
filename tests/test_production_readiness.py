@@ -5,6 +5,7 @@ import pathlib
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 
 from pysqs_extended_client import aws_managed_cmk, customer_key, sse_s3
 from pysqs_extended_client.SQSClientExtended import SQSClientExtended
@@ -167,18 +168,17 @@ def test_s3_before_sqs_raises_before_either_delete(caplog):
 	mock_s3 = FakeS3()
 	mock_s3.objects[("test-bucket", "abc-key")] = b"payload"
 	events = []
-	client = SQSClientExtended(
-		sqs_client=mock_sqs,
-		s3_client=mock_s3,
-		config=ExtendedClientConfiguration(
-			s3_bucket_name="test-bucket",
-			delete_s3_before_sqs=True,
-			on_event=lambda name, **fields: events.append(name),
-		),
-	)
 	with caplog.at_level(logging.ERROR):
 		with pytest.raises(ValueError, match="Neither delete was performed"):
-			client.delete_message("https://sqs.example/queue", EMBEDDED_HANDLE)
+			SQSClientExtended(
+				sqs_client=mock_sqs,
+				s3_client=mock_s3,
+				config=ExtendedClientConfiguration(
+					s3_bucket_name="test-bucket",
+					delete_s3_before_sqs=True,
+					on_event=lambda name, **fields: events.append(name),
+				),
+			)
 	assert mock_s3.objects[("test-bucket", "abc-key")] == b"payload"
 	assert mock_s3.delete_calls == []
 	assert mock_sqs.delete_calls == []
@@ -227,7 +227,13 @@ def test_send_failure_deletes_uploaded_payload():
 	class FailingSqs(FakeSqs):
 		def send_message(self, **kwargs):
 			self.send_calls.append(kwargs)
-			raise RuntimeError("sqs down")
+			raise ClientError(
+				{
+					"Error": {"Code": "InvalidParameterValue", "Message": "rejected"},
+					"ResponseMetadata": {"HTTPStatusCode": 400},
+				},
+				"SendMessage",
+			)
 
 	mock_sqs = FailingSqs()
 	mock_s3 = FakeS3()
@@ -236,7 +242,7 @@ def test_send_failure_deletes_uploaded_payload():
 		s3_client=mock_s3,
 		config=ExtendedClientConfiguration(s3_bucket_name="test-bucket", always_through_s3=True),
 	)
-	with pytest.raises(RuntimeError, match="sqs down"):
+	with pytest.raises(ClientError):
 		client.send_message("https://sqs.example/queue", "hello")
 	assert mock_s3.objects == {}
 	assert len(mock_s3.delete_calls) == 1
@@ -246,7 +252,13 @@ def test_send_failure_logs_orphan_when_s3_cleanup_also_fails(caplog):
 	class FailingSqs(FakeSqs):
 		def send_message(self, **kwargs):
 			self.send_calls.append(kwargs)
-			raise RuntimeError("sqs down")
+			raise ClientError(
+				{
+					"Error": {"Code": "InvalidParameterValue", "Message": "rejected"},
+					"ResponseMetadata": {"HTTPStatusCode": 400},
+				},
+				"SendMessage",
+			)
 
 	class FailingDeleteS3(FakeS3):
 		def delete_object(self, **kwargs):
@@ -264,7 +276,7 @@ def test_send_failure_logs_orphan_when_s3_cleanup_also_fails(caplog):
 		),
 	)
 	with caplog.at_level(logging.WARNING):
-		with pytest.raises(RuntimeError, match="sqs down"):
+		with pytest.raises(ClientError):
 			client.send_message("https://sqs.example/queue", "hello")
 	assert "orphaned" in caplog.text
 	assert "lifecycle" in caplog.text
@@ -483,19 +495,15 @@ def test_delete_batch_s3_before_sqs_raises_before_either_delete():
 	mock_sqs = FakeSqs()
 	mock_s3.objects[("test-bucket", "abc-key")] = b"payload"
 	events = []
-	client = SQSClientExtended(
-		sqs_client=mock_sqs,
-		s3_client=mock_s3,
-		config=ExtendedClientConfiguration(
-			s3_bucket_name="test-bucket",
-			delete_s3_before_sqs=True,
-			on_event=lambda name, **fields: events.append(name),
-		),
-	)
 	with pytest.raises(ValueError, match="Neither delete was performed"):
-		client.delete_message_batch(
-			"https://sqs.example/queue",
-			[{"Id": "1", "ReceiptHandle": EMBEDDED_HANDLE}],
+		SQSClientExtended(
+			sqs_client=mock_sqs,
+			s3_client=mock_s3,
+			config=ExtendedClientConfiguration(
+				s3_bucket_name="test-bucket",
+				delete_s3_before_sqs=True,
+				on_event=lambda name, **fields: events.append(name),
+			),
 		)
 	assert mock_s3.objects[("test-bucket", "abc-key")] == b"payload"
 	assert mock_s3.delete_calls == []
@@ -540,7 +548,13 @@ def test_send_batch_failure_deletes_offloaded_objects_and_partial_failures():
 	class FailingSqs(FakeSqs):
 		def send_message_batch(self, **kwargs):
 			self.send_batch_calls.append(kwargs)
-			raise RuntimeError("sqs down")
+			raise ClientError(
+				{
+					"Error": {"Code": "InvalidParameterValue", "Message": "rejected"},
+					"ResponseMetadata": {"HTTPStatusCode": 400},
+				},
+				"SendMessageBatch",
+			)
 
 	mock_s3 = FakeS3()
 	client = SQSClientExtended(
@@ -548,7 +562,7 @@ def test_send_batch_failure_deletes_offloaded_objects_and_partial_failures():
 		s3_client=mock_s3,
 		config=ExtendedClientConfiguration(s3_bucket_name="test-bucket", always_through_s3=True),
 	)
-	with pytest.raises(RuntimeError, match="sqs down"):
+	with pytest.raises(ClientError):
 		client.send_message_batch(
 			"https://sqs.example/queue",
 			[{"Id": "1", "MessageBody": "one"}, {"Id": "2", "MessageBody": "two"}],
@@ -561,7 +575,7 @@ def test_send_batch_failure_deletes_offloaded_objects_and_partial_failures():
 			self.send_batch_calls.append(kwargs)
 			return {
 				"Successful": [{"Id": "ok"}],
-				"Failed": [{"Id": "bad", "Code": "InternalError", "SenderFault": False}],
+				"Failed": [{"Id": "bad", "Code": "InvalidParameterValue", "SenderFault": True}],
 			}
 
 	mock_sqs = PartialSqs()

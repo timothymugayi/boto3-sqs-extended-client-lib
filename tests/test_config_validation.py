@@ -266,16 +266,13 @@ def test_complete_keys_are_passed_without_region_and_blank_keys_are_omitted(monk
 def test_delete_s3_before_sqs_does_not_warn_at_init_and_raises_before_delete(caplog):
 	events = []
 	with caplog.at_level(logging.WARNING):
-		client = _injected(
-			delete_s3_before_sqs=True,
-			on_event=lambda name, **fields: events.append((name, fields)),
-		)
+		with pytest.raises(ValueError, match="delete_s3_before_sqs=True is not supported"):
+			_injected(
+				delete_s3_before_sqs=True,
+				on_event=lambda name, **fields: events.append((name, fields)),
+			)
 	assert not any("delete_s3_before_sqs" in record.getMessage() for record in caplog.records)
 	assert not any("dead pointer" in record.getMessage() for record in caplog.records)
-	with pytest.raises(ValueError, match="delete_s3_before_sqs=True is not supported"):
-		client.delete_message("https://sqs.example/queue", "plain-handle")
-	assert client.sqs.delete_calls == []
-	assert client.s3.delete_calls == []
 	assert events == []
 
 
