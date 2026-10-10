@@ -27,9 +27,16 @@ Requires Python 3.9+.
 
 PyPI project `pysqs-extended-client` is stuck at **0.0.1** until the account is recovered ([issue #19](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/issues/19)). `0.0.1` does not include the extended client in this tree. Do not `pip install pysqs-extended-client` without a pin.
 
-PyPI publishing of this release is coming once that account is recovered. Until then, install 0.5.1 by pinning the commit SHA of the revision you deploy. A branch name moves, and this release is not tagged.
+PyPI publishing of this release is coming once that account is recovered. Until then, install the tagged 0.5.0 release:
 
 ```bash
+pip install git+https://github.com/timothymugayi/boto3-sqs-extended-client-lib@v0.5.0
+```
+
+The 0.5.1 fixes are on `master` until `v0.5.1` is tagged. Install that branch, or pin the full commit SHA of the revision you deploy. A branch name moves.
+
+```bash
+pip install "pysqs-extended-client @ git+https://github.com/timothymugayi/boto3-sqs-extended-client-lib.git@master"
 pip install "pysqs-extended-client @ git+https://github.com/timothymugayi/boto3-sqs-extended-client-lib.git@<commit-sha>"
 ```
 

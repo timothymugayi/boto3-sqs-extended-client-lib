@@ -6,7 +6,7 @@ Producer and consumer policies, and cross-account access to the payload bucket.
 
 <a id="iam"></a>
 
-## IAM
+## Policies
 
 Prefer one role for producers and one for consumers. Use a dedicated payload bucket. Object actions (`s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`) can be limited to the payload prefix. `s3:ListBucket` cannot: it is granted on the bucket ARN, and a prefix condition does not change `GetObject`. A shared bucket would let the consumer list every key. Add the KMS statements only when `server_side_encryption` is a KMS strategy. `sqs:GetQueueAttributes` is required in 0.5.0 for FIFO send, batch send, and receive. A least-privilege FIFO producer that previously only allowed `sqs:SendMessage` must add it or those calls fail closed.
 
@@ -90,6 +90,8 @@ Uploads default to the bucket's Object Ownership settings (no canned ACL). Prefe
   ]
 }
 ```
+
+When `server_side_encryption` is a KMS strategy, the key policy on the other account's key must allow the producer `kms:GenerateDataKey` and the consumer `kms:Decrypt`. An identity policy on the caller does not grant access to a key in another account.
 
 If you still need a canned ACL, set `s3_canned_acl` (for example `"bucket-owner-read"` or `"bucket-owner-full-control"`). That is passed as `ExtraArgs={"ACL": ...}` on `upload_fileobj`. Buckets with Object Ownership **BucketOwnerEnforced** reject ACLs; leave `s3_canned_acl` unset in that case.
 

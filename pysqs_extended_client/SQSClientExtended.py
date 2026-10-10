@@ -134,6 +134,11 @@ class SQSClientExtended:
 		)
 		self._pool = None
 		self._pool_lock = threading.Lock()
+		# Per-thread count of before-send events for the send in progress.
+		# boto3 retries on the calling thread, and worker threads share this client.
+		self._sqs_send_attempts = threading.local()
+		self._sqs_attempt_hook_registered = False
+		self._register_sqs_send_attempt_hook()
 		self._reject_delete_s3_before_sqs()
 		self.config.freeze()
 
@@ -993,22 +998,46 @@ class SQSClientExtended:
 			return None
 		return attempts
 
+	def _register_sqs_send_attempt_hook(self):
+		"""Record before-send for SendMessage and SendMessageBatch.
+
+		botocore emits ``before-send`` after signing and immediately before the
+		HTTP attempt. A refresh callback runs during the re-sign of a retry,
+		which is before that attempt's ``before-send`` and after attempt 1
+		already emitted it. The callback can raise any exception.
+
+		``unique_id`` makes a second register of this client a no-op. Injected
+		clients without ``meta.events`` keep the type-based fallback.
+		"""
+		events = getattr(getattr(self.sqs, "meta", None), "events", None)
+		register = getattr(events, "register", None)
+		if not callable(register):
+			return
+		for operation in ("SendMessage", "SendMessageBatch"):
+			register(
+				"before-send.sqs.%s" % operation,
+				self._note_sqs_send_attempt,
+				unique_id="pysqs-extended-client-before-send-%s-%s" % (id(self), operation),
+			)
+		self._sqs_attempt_hook_registered = True
+
+	def _note_sqs_send_attempt(self, **kwargs):
+		self._sqs_send_attempts.count = getattr(self._sqs_send_attempts, "count", 0) + 1
+
+	def _reset_sqs_send_attempts(self):
+		self._sqs_send_attempts.count = 0
+
+	def _sqs_send_was_attempted(self):
+		return getattr(self._sqs_send_attempts, "count", 0) > 0
+
 	def _is_pre_send_validation_error(self, exc):
-		"""True when the failure provably happens before any request reaches SQS.
+		"""Fallback when the SQS client has no before-send events.
 
-		``ParamValidationError`` is the usual case. ``ValidationError`` covers
-		alias conflicts and unknown parameters. ``MissingParametersError`` is
-		the same class of client-side check. ``NoCredentialsError`` is raised
-		by the signer when the credentials object is None, which fails the
-		first signature before any HTTP attempt. A later retry does not clear
-		that object. ``UnknownCredentialError`` is a named-provider lookup
-		while the credential chain is configured, also before a request.
-
-		``CredentialRetrievalError`` and ``PartialCredentialsError`` are
-		omitted. botocore re-signs, and may refresh credentials, before every
-		retry. A refresh can raise those after attempt 1 already reached SQS.
-		``EndpointConnectionError`` is omitted for the same reason: the request
-		may already have been sent.
+		Used for injected clients that are not botocore clients. These types
+		are the ones botocore raises while validating parameters or resolving
+		a missing credential provider, which is before an HTTP attempt on a
+		real client. A refresh callback can raise the same types after an
+		attempt was already sent; that case is decided by ``before-send``.
 		"""
 		return isinstance(exc, (
 			ParamValidationError,
@@ -1026,7 +1055,7 @@ class SQSClientExtended:
 		)
 
 	def _is_definite_sqs_rejection(self, exc):
-		"""True only when SQS definitely refused the send.
+		"""True only when the send cannot already be stored in SQS.
 
 		A botocore ``ClientError`` whose HTTP status is 4xx is a rejection
 		only when its operation is ``SendMessage`` or ``SendMessageBatch`` and
@@ -1034,20 +1063,25 @@ class SQSClientExtended:
 		from STS (for example ``AssumeRole``) during a credential refresh is
 		not an SQS rejection. boto3 retries a timeout, then a later 400
 		``RequestThrottled`` can report ``RetryAttempts`` greater than 0: the
-		first attempt may already be stored. That case is uncertain. A
-		client-side validation error, ``NoCredentialsError``, or
-		``UnknownCredentialError`` is a rejection because no request reached
-		SQS. Timeouts, connection errors, 5xx, credential-refresh failures,
-		and a ``ClientError`` with no status are uncertain.
+		first attempt may already be stored.
+
+		Any other exception is a definite rejection only when this call's
+		``before-send`` event did not run, so no HTTP attempt left the client.
+		botocore re-signs before every retry, and the refresh callback can
+		raise any type (including ``NoCredentialsError`` and
+		``ParamValidationError``) after attempt 1 was already sent. An injected
+		client without ``meta.events`` uses the type-based fallback.
 		"""
-		if self._is_pre_send_validation_error(exc):
-			return True
-		status = self._client_error_status(exc)
-		if status is None or not (400 <= status <= 499):
-			return False
-		if not self._is_sqs_send_operation(exc):
-			return False
-		return self._retry_attempts(exc) == 0
+		if isinstance(exc, ClientError):
+			status = self._client_error_status(exc)
+			if status is None or not (400 <= status <= 499):
+				return False
+			if not self._is_sqs_send_operation(exc):
+				return False
+			return self._retry_attempts(exc) == 0
+		if self._sqs_attempt_hook_registered:
+			return not self._sqs_send_was_attempted()
+		return self._is_pre_send_validation_error(exc)
 
 	def _retain_uncertain_upload(self, body):
 		"""Keep an uploaded object when the send may already have been stored."""
@@ -1259,6 +1293,7 @@ class SQSClientExtended:
 		if message_deduplication_id:
 			params["MessageDeduplicationId"] = message_deduplication_id
 		try:
+			self._reset_sqs_send_attempts()
 			return self.sqs.send_message(**params)
 		except Exception as exc:
 			self._release_offloaded_send(
@@ -1365,6 +1400,7 @@ class SQSClientExtended:
 		params = {"QueueUrl": queue_url, "Entries": sqs_entries}
 		params.update(kwargs)
 		try:
+			self._reset_sqs_send_attempts()
 			result = self.sqs.send_message_batch(**params)
 		except Exception as exc:
 			definite = self._is_definite_sqs_rejection(exc)

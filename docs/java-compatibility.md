@@ -1,6 +1,6 @@
 # Java compatibility
 
-The **Amazon SQS Extended Client Library for Python** (version **0.5.1**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit) and puts a pointer on the queue.
+Pointer format and the rules for sharing a queue with the [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). Install and the current version are in the [README](../README.md).
 
 [README](../README.md) · [Configuration](configuration.md) · [IAM](iam.md) · [FIFO and redrive](fifo-and-redrive.md) · [Events](events.md) · [Binary and files](binary-and-files.md) · Java compatibility · [Migration](migration.md) · [Testing](testing.md)
 

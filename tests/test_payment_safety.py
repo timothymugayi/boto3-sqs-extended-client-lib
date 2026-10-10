@@ -1310,6 +1310,7 @@ def test_uncertain_retain_ignores_a_body_that_is_not_a_pointer():
 
 def test_client_error_without_an_integer_status_is_not_a_definite_rejection():
 	client, _mock_sqs, _mock_s3 = make_client()
+	assert client._client_error_status(NoCredentialsError()) is None
 	missing = _client_error("InternalError", status=400)
 	missing.response = None
 	assert client._is_definite_sqs_rejection(missing) is False
@@ -1453,6 +1454,11 @@ def test_4xx_without_retry_attempts_keeps_the_object():
 
 
 def test_credential_error_before_send_deletes_the_object_and_connection_error_does_not():
+	"""Injected clients without meta.events keep the type fallback.
+
+	A real botocore client records before-send and can see the same exception
+	after attempt 1 was already sent. Those cases are covered separately.
+	"""
 	class NoCreds(FakeSqs):
 		def send_message(self, **kwargs):
 			self.send_calls.append(kwargs)
