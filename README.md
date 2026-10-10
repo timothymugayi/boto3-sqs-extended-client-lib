@@ -4,7 +4,7 @@ Boto3 SQS Extended Client Library for Python
 [![Tests](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/actions/workflows/tests.yml)
 [![codecov](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib/branch/master/graph/badge.svg)](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib)
 
-The **Amazon SQS Extended Client Library for Python** (version **0.4.1**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit) and puts a pointer on the queue.
+The **Amazon SQS Extended Client Library for Python** (version **0.5.0**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit) and puts a pointer on the queue.
 
 You can:
 
@@ -25,19 +25,24 @@ You can:
 
 Requires Python 3.9+.
 
-After **0.4.1** is on PyPI:
+PyPI project `pysqs-extended-client` is stuck at **0.0.1** until the account is recovered ([issue #19](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/issues/19)). `0.0.1` does not include the extended client in this tree. Do not `pip install pysqs-extended-client` without a pin.
+
+Install a specific commit. Pin the full commit SHA of the revision you deploy. A branch name moves.
 
 ```bash
-pip install "pysqs-extended-client>=0.4.1"
+pip install "pysqs-extended-client @ git+https://github.com/timothymugayi/boto3-sqs-extended-client-lib.git@<commit-sha>"
 ```
 
-PyPI project `pysqs-extended-client` still serves **0.0.1** only ([issue #19](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/issues/19)). Until the maintainer publishes 0.4.1, install from this repository:
+## Required before production
 
-```bash
-pip install "pysqs-extended-client @ git+https://github.com/timothymugayi/boto3-sqs-extended-client-lib.git"
-```
+These are not optional, and this library does not do them. A green test run does not show that they are in place. The library is ready for a payment only when the code in this release is what you run **and** every condition below is true.
 
-Do not `pip install pysqs-extended-client` without a version pin until that upload exists. `0.0.1` does not include the extended client in this tree.
+* The payload prefix has an S3 lifecycle rule whose expiration is longer than the **sum** of the source-queue retention and the dead-letter retention. The dead-letter clock starts when the message arrives there, after it has already sat in the source, so being longer than each retention on its own is not enough. A shorter rule deletes the object while the message can still be read. That is the missing-object loss. Purge leaves the objects. A failed delete after SQS has already succeeded leaves the object. A failed delete after a send that SQS did not accept can leave one too. The library cannot create the rule and cannot remove the object while S3 is down.
+* The FIFO queue has a redrive policy with a `deadLetterTargetArn` and a `maxReceiveCount`. Send, batch send, and receive on a `.fifo` queue read `RedrivePolicy` and refuse to run when it is missing, empty, or lacks either field. The check is not cached. Someone still has to create the policy. The dead-letter queue must also be FIFO, or SQS rejects the policy. This library checks only the source queue's `RedrivePolicy`. It creates neither queue. A dead-letter queue that nobody reads is not enough.
+* The handler is idempotent on the instruction id inside the payload, not the SQS message id. A `message_deduplication_id` expires after 5 minutes, and a move to the dead-letter queue is a new message id. This library cannot extend that interval, and it does not invent a deduplication id.
+* This library is the only receiver and the only deleter on the queue. Java may send text. The Java extended client still deletes the SQS message when the object is missing, and it still deletes the object before the message. If that client receives or deletes, the payment can still disappear, and this library's `message_left` callback does not fire. There is no change inside this repo that stops the Java client.
+
+A timeout during receive still counts as a receive. A message dead-lettered that way is recoverable until the dead-letter retention, as long as the lifecycle rule has not deleted the object. It is not the missing-object loss.
 
 ## Usage
 
@@ -78,14 +83,22 @@ for message in messages:
 
 ### FIFO queues
 
-```python
-import uuid
+A payment send uses a FIFO queue. A standard queue can deliver the same body twice, and this library cannot stop that.
 
+Pass `message_group_id` on its own when the queue uses content-based deduplication and the body stays inline. That body does not change, so SQS can deduplicate it. If the queue does not use content-based deduplication, SQS rejects the send. That rejection is not a posted message, and this library emits nothing: nothing was uploaded.
+
+An offloaded body contains a new S3 key, so content-based deduplication will not collapse a retry. `send_message` and `send_message_batch` raise before any S3 upload when the queue name ends in `.fifo` and `message_deduplication_id` was not passed. A batch raises before any entry is uploaded or sent. This library does not invent a deduplication id. A caller-supplied id stops a second copy only inside SQS's 5-minute dedup interval. After that, the same id is a new message.
+
+Before send, batch send, and receive, a `.fifo` queue must have a `RedrivePolicy` with `deadLetterTargetArn` and `maxReceiveCount`. The client reads it with `GetQueueAttributes` on every call (the result is not cached) and raises before any upload or receive when the call fails or the policy is missing, empty, or incomplete. It emits nothing. It checks only that queue, and it creates neither the source queue nor the dead-letter queue. The dead-letter queue must be FIFO or SQS rejects the policy. The demo queue `sqs-extended-demo.fifo` is created without a redrive policy; send and receive through this library raise until you set one.
+
+```python
 sqs.send_message(
     queue_url,
     message,
-    message_group_id=str(uuid.uuid4()),
-    message_deduplication_id=str(uuid.uuid4()),
+    message_group_id="instruction-group",
+    # Required when this body will be offloaded. Omit it only for an inline
+    # body on a queue that has content-based deduplication.
+    message_deduplication_id="instruction-id",
 )
 ```
 
@@ -144,9 +157,9 @@ config = ExtendedClientConfiguration(
     always_through_s3=False,
     payload_support_enabled=True,  # False: pass through, no S3 offload/hydrate/delete
     cleanup_s3_payload=True,
-    delete_s3_before_sqs=False,  # True matches Java's S3-then-SQS delete order
+    delete_s3_before_sqs=False,  # True raises: S3-before-SQS is not supported
     use_legacy_attribute=True,
-    ignore_payload_not_found=False,
+    ignore_payload_not_found=False,  # does not delete; a missing object leaves the SQS message
     s3_key_prefix="payloads/",
     s3_canned_acl=None,  # e.g. "bucket-owner-read"; omit unless Object Ownership allows ACLs
     server_side_encryption=customer_key("alias/my-payload-key"),  # or aws_managed_cmk() / sse_s3()
@@ -180,9 +193,9 @@ These run when `ExtendedClientConfiguration` or `SQSClientExtended` is created.
 
 * **`server_side_encryption`.** `None` or a `ServerSideEncryptionStrategy` (`aws_managed_cmk()`, `customer_key(...)`, `sse_s3()`). Anything else is `TypeError` at config construction. A wrong object used to fail later, when the upload called `extra_args`.
 
-* **`delete_s3_before_sqs=True`.** One warning at client construction about the dead-pointer risk (S3 is removed before the SQS delete). The error log when that delete then fails is unchanged.
+* **`delete_s3_before_sqs=True` (0.5.0).** `delete_message` and `delete_message_batch` raise `ValueError` before either delete. The 0.4.1 construction warning is gone. There is no S3-then-SQS path and no dead-pointer callback. Leave the flag unset so the SQS message is deleted first.
 
-* **`ignore_payload_not_found`.** When a missing S3 object causes the SQS message to be deleted, the client still logs a warning. If `on_event` is set, it is called as `payload_missing_deleted` with `queue_url`, `s3_bucket_name`, `s3_key`, and `receipt_handle`.
+* **`ignore_payload_not_found` (0.5.0).** The flag does not delete the SQS message. A confirmed S3 not-found leaves the message in the queue and, if `on_event` is set, calls it as `message_left` with `cause=s3_not_found`. The 0.4.1 `payload_missing_deleted` callback is gone. The same `message_left` event, with `cause=broken_pointer`, fires when `s3BucketName` or `s3Key` is missing or empty. A timeout or an HTTP 5xx raises, does not delete, and emits nothing.
 
 ### Server-side encryption
 
@@ -194,20 +207,22 @@ These run when `ExtendedClientConfiguration` or `SQSClientExtended` is created.
 
 Downloads of SSE-KMS objects use the caller's IAM `kms:Decrypt`. The client does not implement customer-provided keys (SSE-C).
 
-### Deletes, dead pointers, and orphaned objects
+### Deletes and orphaned objects
 
-Default delete order is **SQS first**, then a best-effort S3 delete.
+Delete order is **SQS first**, then a best-effort S3 delete. `delete_s3_before_sqs=True` raises before either delete on `delete_message` and `delete_message_batch`. There is no S3-then-SQS path. The caller is not told the object went first when it did not.
 
 * If `DeleteMessage` fails, the S3 object is still there. Retry the delete after the visibility timeout.
-* If the SQS delete succeeds and the S3 delete fails, the queue message is gone and the object is orphaned. The error is logged and not raised.
+* If the SQS delete succeeds and the S3 delete fails, the queue message is gone and the object is left in the bucket. `on_event` is called as `s3_object_orphaned` with `case=after_sqs_succeeded`. The SQS delete still stands. The event means the object is still in the bucket. It does not mean a lifecycle rule removed it.
 
-The Java extended client deletes S3 **first**. If SQS delete then fails, the message stays on the queue and points at a missing object (a dead pointer). Receipt-handle markers are the same either way, so Java consumers can still read messages this client sent. Set `delete_s3_before_sqs=True` only if you need that Java failure mode. Construction logs one warning when the flag is set. This client also logs an error when that path creates a dead pointer.
+Receipt-handle markers stay compatible with Java either way, so a Java producer can still send text this client reads. Do not let the Java extended client receive or delete on this queue. It still deletes the SQS message when the object is missing, and it still deletes the object before the message.
 
 `purge_queue` clears SQS only. S3 objects are left behind.
 
-If `send_message` uploads to S3 and the SQS send then fails, the client tries to delete that object. The same cleanup runs for batch entries that SQS reports as failed, and for S3 objects uploaded in a batch whose offload fails before any send. That cleanup is best-effort. An object is also orphaned if the process dies between the S3 put and the SQS send, or if `purge_queue` is used.
+If `send_message` uploads to S3 and the SQS send then fails, the client tries to delete that object. The same cleanup runs for batch entries that SQS reports as failed, and for S3 objects uploaded in a batch whose offload fails before any send. That cleanup is best-effort. If it fails, `on_event` is called as `s3_object_orphaned` with `case=after_upload_sqs_rejected`. An object is also left behind if the process dies between the S3 put and the SQS send, or if `purge_queue` is used.
 
-Put a lifecycle rule on the payload prefix so leftovers expire. Abort incomplete multipart uploads in the same rule. Example (expire payloads after 14 days):
+A confirmed missing object, or a pointer missing `s3BucketName` or `s3Key`, does not delete the SQS message. `on_event` is `message_left`. A successful offload, hydrate, or delete does not use `message_left` or `s3_object_orphaned`. The FIFO deduplication raise and the redrive raise emit nothing: both happen before any upload.
+
+Put a lifecycle rule on the payload prefix so leftovers expire. Abort incomplete multipart uploads in the same rule. The expiration must be longer than the sum of the source-queue retention and the dead-letter retention (see Required before production). Example (expire payloads after 14 days, which is only enough when that sum is shorter):
 
 ```json
 {
@@ -233,7 +248,7 @@ Producer (send):
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["sqs:SendMessage"],
+      "Action": ["sqs:SendMessage", "sqs:GetQueueAttributes"],
       "Resource": "arn:aws:sqs:us-east-1:123456789012:my-queue"
     },
     {
@@ -258,7 +273,7 @@ Consumer (receive, delete, visibility). `s3:DeleteObject` is required only when 
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility"],
+      "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"],
       "Resource": "arn:aws:sqs:us-east-1:123456789012:my-queue"
     },
     {
@@ -296,7 +311,7 @@ config = ExtendedClientConfiguration(
     s3_bucket_name="my-payload-bucket",
     max_pool_connections=50,
     s3_max_concurrency=10,
-    on_event=lambda name, **fields: None,  # optional metrics: s3_offload / s3_hydrate / s3_delete
+    on_event=lambda name, **fields: None,  # s3_offload / s3_hydrate / s3_delete are debug metrics; message_left and s3_object_orphaned are the failure signals
 )
 ```
 

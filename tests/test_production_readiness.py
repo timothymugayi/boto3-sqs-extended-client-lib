@@ -120,16 +120,24 @@ def test_s3_cleanup_failure_after_sqs_delete_is_best_effort(caplog):
 
 	mock_sqs = FakeSqs()
 	mock_s3 = FailingDeleteS3()
+	events = []
 	client = SQSClientExtended(
 		sqs_client=mock_sqs,
 		s3_client=mock_s3,
-		config=ExtendedClientConfiguration(s3_bucket_name="test-bucket"),
+		config=ExtendedClientConfiguration(
+			s3_bucket_name="test-bucket",
+			on_event=lambda name, **fields: events.append((name, fields)),
+		),
 	)
 	with caplog.at_level(logging.WARNING):
 		result = client.delete_message("https://sqs.example/queue", EMBEDDED_HANDLE)
 	assert result == {}
 	assert mock_sqs.delete_calls[0]["ReceiptHandle"] == "orig-handle"
 	assert "orphaned" in caplog.text
+	assert events[0][0] == "s3_object_orphaned"
+	assert events[0][1]["case"] == "after_sqs_succeeded"
+	assert events[0][1]["s3_key"] == "abc-key"
+	assert "message_left" not in [name for name, _ in events]
 
 
 def test_default_delete_order_is_sqs_then_s3():
@@ -154,29 +162,28 @@ def test_default_delete_order_is_sqs_then_s3():
 	assert order == ["sqs", "s3"]
 
 
-def test_s3_before_sqs_logs_dead_pointer_when_queue_delete_fails(caplog):
-	class FailingSqs(FakeSqs):
-		def delete_message(self, **kwargs):
-			self.delete_calls.append(kwargs)
-			raise RuntimeError("sqs down")
-
-	mock_sqs = FailingSqs()
+def test_s3_before_sqs_raises_before_either_delete(caplog):
+	mock_sqs = FakeSqs()
 	mock_s3 = FakeS3()
 	mock_s3.objects[("test-bucket", "abc-key")] = b"payload"
+	events = []
 	client = SQSClientExtended(
 		sqs_client=mock_sqs,
 		s3_client=mock_s3,
 		config=ExtendedClientConfiguration(
 			s3_bucket_name="test-bucket",
 			delete_s3_before_sqs=True,
+			on_event=lambda name, **fields: events.append(name),
 		),
 	)
 	with caplog.at_level(logging.ERROR):
-		with pytest.raises(RuntimeError, match="sqs down"):
+		with pytest.raises(ValueError, match="Neither delete was performed"):
 			client.delete_message("https://sqs.example/queue", EMBEDDED_HANDLE)
-	assert ("test-bucket", "abc-key") not in mock_s3.objects
-	assert "dead pointer" in caplog.text
-	assert mock_sqs.delete_calls[0]["ReceiptHandle"] == "orig-handle"
+	assert mock_s3.objects[("test-bucket", "abc-key")] == b"payload"
+	assert mock_s3.delete_calls == []
+	assert mock_sqs.delete_calls == []
+	assert "dead pointer" not in caplog.text
+	assert events == []
 
 
 def test_delete_batch_keeps_s3_object_when_sqs_entry_fails():
@@ -246,16 +253,25 @@ def test_send_failure_logs_orphan_when_s3_cleanup_also_fails(caplog):
 			self.delete_calls.append(kwargs)
 			raise RuntimeError("s3 down")
 
+	events = []
 	client = SQSClientExtended(
 		sqs_client=FailingSqs(),
 		s3_client=FailingDeleteS3(),
-		config=ExtendedClientConfiguration(s3_bucket_name="test-bucket", always_through_s3=True),
+		config=ExtendedClientConfiguration(
+			s3_bucket_name="test-bucket",
+			always_through_s3=True,
+			on_event=lambda name, **fields: events.append((name, fields)),
+		),
 	)
 	with caplog.at_level(logging.WARNING):
 		with pytest.raises(RuntimeError, match="sqs down"):
 			client.send_message("https://sqs.example/queue", "hello")
 	assert "orphaned" in caplog.text
 	assert "lifecycle" in caplog.text
+	orphan = [item for item in events if item[0] == "s3_object_orphaned"]
+	assert len(orphan) == 1
+	assert orphan[0][1]["case"] == "after_upload_sqs_rejected"
+	assert "message_left" not in [name for name, _ in events]
 
 
 def test_receive_payload_dir_streams_with_download_file(tmp_path):
@@ -462,81 +478,29 @@ def test_best_effort_pointer_delete_ignores_bodies_that_are_not_s3_pointers():
 	assert mock_s3.delete_calls == []
 
 
-def test_delete_batch_s3_before_sqs_removes_objects_then_queue_batch():
-	order = []
-
-	class OrderingSqs(FakeSqs):
-		def delete_message_batch(self, **kwargs):
-			order.append("sqs")
-			return super().delete_message_batch(**kwargs)
-
-	class OrderingS3(FakeS3):
-		def delete_object(self, **kwargs):
-			order.append("s3")
-			return super().delete_object(**kwargs)
-
-	mock_s3 = OrderingS3()
-	mock_s3.objects[("test-bucket", "abc-key")] = b"payload"
-	client = SQSClientExtended(
-		sqs_client=OrderingSqs(),
-		s3_client=mock_s3,
-		config=ExtendedClientConfiguration(
-			s3_bucket_name="test-bucket",
-			delete_s3_before_sqs=True,
-		),
-	)
-	client.delete_message_batch(
-		"https://sqs.example/queue",
-		[{"Id": "1", "ReceiptHandle": EMBEDDED_HANDLE}],
-	)
-	assert order == ["s3", "sqs"]
-	assert ("test-bucket", "abc-key") not in mock_s3.objects
-
-
-def test_delete_batch_s3_before_sqs_logs_dead_pointers_when_queue_batch_fails(caplog):
-	class FailingSqs(FakeSqs):
-		def delete_message_batch(self, **kwargs):
-			self.delete_batch_calls.append(kwargs)
-			raise RuntimeError("batch down")
-
+def test_delete_batch_s3_before_sqs_raises_before_either_delete():
 	mock_s3 = FakeS3()
-	mock_s3.objects[("test-bucket", "abc-key")] = b"payload"
-	client = SQSClientExtended(
-		sqs_client=FailingSqs(),
-		s3_client=mock_s3,
-		config=ExtendedClientConfiguration(
-			s3_bucket_name="test-bucket",
-			delete_s3_before_sqs=True,
-		),
-	)
-	with caplog.at_level(logging.ERROR):
-		with pytest.raises(RuntimeError, match="batch down"):
-			client.delete_message_batch(
-				"https://sqs.example/queue",
-				[{"Id": "1", "ReceiptHandle": EMBEDDED_HANDLE}],
-			)
-	assert ("test-bucket", "abc-key") not in mock_s3.objects
-	assert "dead pointers" in caplog.text
-
-
-def test_s3_first_delete_propagates_s3_failure_without_deleting_sqs():
-	class FailingDeleteS3(FakeS3):
-		def delete_object(self, **kwargs):
-			self.delete_calls.append(kwargs)
-			raise RuntimeError("s3 down")
-
 	mock_sqs = FakeSqs()
+	mock_s3.objects[("test-bucket", "abc-key")] = b"payload"
+	events = []
 	client = SQSClientExtended(
 		sqs_client=mock_sqs,
-		s3_client=FailingDeleteS3(),
+		s3_client=mock_s3,
 		config=ExtendedClientConfiguration(
 			s3_bucket_name="test-bucket",
 			delete_s3_before_sqs=True,
+			on_event=lambda name, **fields: events.append(name),
 		),
 	)
-	with pytest.raises(RuntimeError, match="s3 down"):
-		client.delete_message("https://sqs.example/queue", EMBEDDED_HANDLE)
-	assert mock_sqs.delete_calls == []
+	with pytest.raises(ValueError, match="Neither delete was performed"):
+		client.delete_message_batch(
+			"https://sqs.example/queue",
+			[{"Id": "1", "ReceiptHandle": EMBEDDED_HANDLE}],
+		)
+	assert mock_s3.objects[("test-bucket", "abc-key")] == b"payload"
+	assert mock_s3.delete_calls == []
+	assert mock_sqs.delete_batch_calls == []
+	assert events == []
 
 
 def test_delete_batch_skips_s3_cleanup_when_id_missing_from_successful():

@@ -69,6 +69,8 @@ class ExtendedClientConfiguration:
 		self.message_size_threshold = message_size_threshold
 		self.cleanup_s3_payload = cleanup_s3_payload
 		self.use_legacy_attribute = use_legacy_attribute
+		# Retained so existing callers still construct. It does not delete the SQS
+		# message. A confirmed missing object leaves that message in the queue.
 		self.ignore_payload_not_found = ignore_payload_not_found
 		self.s3_key_prefix = self.validate_s3_key_prefix(s3_key_prefix)
 		self.max_pool_connections = max_pool_connections
@@ -81,10 +83,9 @@ class ExtendedClientConfiguration:
 		self.s3_canned_acl = s3_canned_acl
 		self.server_side_encryption = server_side_encryption
 		self.payload_support_enabled = payload_support_enabled
-		# Java deletes the S3 object before DeleteMessage. That leaves a dead
-		# pointer when SQS delete fails. The default here deletes SQS first and
-		# then best-effort cleans S3. Set delete_s3_before_sqs=True for the Java
-		# order. SQSClientExtended logs one warning at init when this is true.
+		# True is refused. delete_message and delete_message_batch raise before
+		# either delete so the caller is not told the object was removed first.
+		# There is no S3-then-SQS path and no dead-pointer path.
 		self.delete_s3_before_sqs = delete_s3_before_sqs
 		self.on_event = on_event
 

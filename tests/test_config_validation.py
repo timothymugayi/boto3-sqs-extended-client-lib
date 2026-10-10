@@ -263,24 +263,23 @@ def test_complete_keys_are_passed_without_region_and_blank_keys_are_omitted(monk
 	assert "region_name" not in created[0][1]
 
 
-def test_delete_s3_before_sqs_logs_one_warning_at_init(caplog):
+def test_delete_s3_before_sqs_does_not_warn_at_init_and_raises_before_delete(caplog):
+	events = []
 	with caplog.at_level(logging.WARNING):
-		client = _injected(delete_s3_before_sqs=True)
-		client.delete_message("https://sqs.example/queue", "plain-handle")
-	warnings = [
-		record for record in caplog.records
-		if record.levelno == logging.WARNING and "dead pointer" in record.getMessage()
-	]
-	assert len(warnings) == 1
-	assert "delete_s3_before_sqs=True" in warnings[0].getMessage()
-
-	caplog.clear()
-	with caplog.at_level(logging.WARNING):
-		_injected(delete_s3_before_sqs=False)
+		client = _injected(
+			delete_s3_before_sqs=True,
+			on_event=lambda name, **fields: events.append((name, fields)),
+		)
+	assert not any("delete_s3_before_sqs" in record.getMessage() for record in caplog.records)
 	assert not any("dead pointer" in record.getMessage() for record in caplog.records)
+	with pytest.raises(ValueError, match="delete_s3_before_sqs=True is not supported"):
+		client.delete_message("https://sqs.example/queue", "plain-handle")
+	assert client.sqs.delete_calls == []
+	assert client.s3.delete_calls == []
+	assert events == []
 
 
-def test_ignore_payload_not_found_emits_payload_missing_deleted(caplog):
+def test_confirmed_not_found_leaves_message_even_when_ignore_is_on(caplog):
 	events = []
 	client = _injected(
 		ignore_payload_not_found=True,
@@ -289,20 +288,15 @@ def test_ignore_payload_not_found_emits_payload_missing_deleted(caplog):
 	client.sqs.receive_response = {"Messages": [_pointer_message()]}
 	with caplog.at_level(logging.WARNING):
 		assert client.receive_message("https://sqs.example/queue") == []
-	assert client.sqs.delete_calls[0]["ReceiptHandle"] == "orig-handle"
-	assert "could not be found in S3" in caplog.text
-	assert events == [(
-		"payload_missing_deleted",
-		{
-			"queue_url": "https://sqs.example/queue",
-			"s3_bucket_name": "test-bucket",
-			"s3_key": "missing-key",
-			"receipt_handle": "orig-handle",
-		},
-	)]
+	assert client.sqs.delete_calls == []
+	assert "not deleted" in caplog.text
+	assert "payload_missing_deleted" not in caplog.text
+	assert events[0][0] == "message_left"
+	assert events[0][1]["cause"] == "s3_not_found"
+	assert events[0][1]["receipt_handle"] == "orig-handle"
 
 
-def test_ignore_payload_not_found_emits_when_hydrate_returns_none():
+def test_hydrate_returning_none_is_not_a_confirmed_not_found():
 	events = []
 	client = _injected(
 		ignore_payload_not_found=True,
@@ -312,9 +306,9 @@ def test_ignore_payload_not_found_emits_when_hydrate_returns_none():
 	client.sqs.receive_response = {
 		"Messages": [_pointer_message(key="empty-body", receipt="receipt-2")]
 	}
-	assert client.receive_message("https://sqs.example/queue") == []
-	assert client.sqs.delete_calls[0]["ReceiptHandle"] == "receipt-2"
-	assert events[0][0] == "payload_missing_deleted"
-	assert events[0][1]["s3_key"] == "empty-body"
-	assert events[0][1]["receipt_handle"] == "receipt-2"
+	with pytest.raises(ValueError, match="empty-body"):
+		client.receive_message("https://sqs.example/queue")
+	assert client.sqs.delete_calls == []
+	assert events == []
+	assert client.sqs.visibility_calls == []
 	client.close()

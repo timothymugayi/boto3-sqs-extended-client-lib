@@ -1,6 +1,24 @@
 Changelog
 =========
 
+0.5.0
+-----
+
+Breaking release. A confirmed missing payload stays on the queue, FIFO
+offload requires a caller-supplied deduplication id, and a FIFO queue
+without a redrive policy is refused. This does not make the library
+production ready on its own. The bucket lifecycle rule, the redrive
+policy, an idempotent handler, and a single receiver still have to be
+in place outside this package.
+
+* **Reverses 0.4.1.** A confirmed S3 not-found (``NoSuchKey``, ``404``, or ``NotFound``) no longer deletes the SQS message, including when ``ignore_payload_not_found`` is set. That flag does not delete. The ``payload_missing_deleted`` callback is gone. The message stays in the queue and, if ``on_event`` is set, the callback is ``message_left`` with ``cause=s3_not_found``. The receipt handle is not returned to the caller. A timeout or an HTTP 5xx raises, does not delete, emits nothing, and is not treated as not-found. The receive is not undone.
+* **Reverses 0.4.1.** ``delete_s3_before_sqs=True`` no longer logs a warning at construction and no longer deletes S3 first. ``delete_message`` and ``delete_message_batch`` raise ``ValueError`` before either delete. There is no dead-pointer path and no event for this raise.
+* A pointer that is missing ``s3BucketName`` or ``s3Key``, or has an empty value, is not downloaded. The SQS message is left in place and ``message_left`` is emitted with ``cause=broken_pointer``.
+* An inline binary body is sized as the base64 body, plus the caller's attributes, plus 38 bytes for the ``SQSExtendedContentType`` / ``String`` / ``binary-b64`` attribute. Over ``message_size_threshold`` (default 262144), the raw bytes are offloaded with content type ``binary``. Text sizing is unchanged.
+* ``message_group_id`` may be sent without ``message_deduplication_id``. On a queue whose name ends in ``.fifo``, a payload that would be offloaded without ``message_deduplication_id`` raises before any S3 upload, on ``send_message`` and on ``send_message_batch``. The batch raises before any entry is uploaded or sent. The library does not invent a deduplication id. An inline FIFO send is attempted; if SQS rejects it, that rejection is not a posted message and nothing is emitted.
+* Before ``send_message``, ``send_message_batch``, and ``receive_message`` on a ``.fifo`` queue, the client reads ``RedrivePolicy`` with ``GetQueueAttributes``. It raises if the call fails, the policy is missing or empty, or it lacks ``deadLetterTargetArn`` or ``maxReceiveCount``. The send raise happens before any S3 upload. The receive raise happens before the receive call. The result is not cached. Nothing is emitted. The library does not create the queue or the policy, and it checks only the queue it was given.
+* A failed S3 cleanup emits ``s3_object_orphaned``. ``case=after_sqs_succeeded`` means the SQS delete already succeeded. ``case=after_upload_sqs_rejected`` means the object was uploaded and SQS did not accept the send. A successful offload, hydrate, or delete does not use ``message_left`` or ``s3_object_orphaned``. The FIFO dedup raise and the redrive raise emit nothing.
+
 0.4.1
 -----
 
