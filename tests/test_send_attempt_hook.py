@@ -27,6 +27,7 @@ from pysqs_extended_client.SQSClientExtended import (
 	EVENT_S3_OBJECT_ORPHANED,
 	ORPHAN_AFTER_SQS_UNCERTAIN,
 	SQSClientExtended,
+	_SEND_ATTEMPT_TRACKERS,
 	_SQS_SEND_ATTEMPT_HOOK_PREFIX,
 )
 from pysqs_extended_client.extended_config import ExtendedClientConfiguration
@@ -47,6 +48,9 @@ class _Handler(BaseHTTPRequestHandler):
 		if length:
 			self.rfile.read(length)
 		self.server.hits.append(self.path)
+		if self.server.hold_first and len(self.server.hits) == 1:
+			self.server.first_hit.set()
+			self.server.allow_response.wait(timeout=5)
 		status = self.server.status
 		if status >= 500:
 			body = _ERROR_XML % (b"Receiver", b"InternalError")
@@ -63,10 +67,13 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 @contextmanager
-def _sqs_server(status):
+def _sqs_server(status, hold_first=False):
 	server = HTTPServer(("127.0.0.1", 0), _Handler)
 	server.status = status
 	server.hits = []
+	server.hold_first = hold_first
+	server.first_hit = threading.Event()
+	server.allow_response = threading.Event()
 	thread = threading.Thread(target=server.serve_forever, daemon=True)
 	thread.start()
 	try:
@@ -93,7 +100,7 @@ def _credentials(refresh):
 	)
 
 
-def _extended_client(server, refresh, events, max_attempts=2):
+def _extended_client(server, refresh, events, max_attempts=2, read_timeout=2):
 	botocore_session = botocore.session.get_session()
 	botocore_session._credentials = _credentials(refresh)
 	sqs = boto3.Session(botocore_session=botocore_session).client(
@@ -103,7 +110,7 @@ def _extended_client(server, refresh, events, max_attempts=2):
 		config=Config(
 			retries={"max_attempts": max_attempts, "mode": "standard"},
 			connect_timeout=2,
-			read_timeout=2,
+			read_timeout=read_timeout,
 		),
 	)
 	s3 = FakeS3()
@@ -284,10 +291,9 @@ def test_before_send_hook_is_registered_once_per_operation():
 	client.sqs.meta.events.emit("before-send.sqs.SendMessage", request=None)
 	client.sqs.meta.events.emit("before-send.sqs.SendMessageBatch", request=None)
 	assert client._sqs_send_attempt_count() == 2
-	assert _before_send_hook_ids(sqs) == [
-		"pysqs-extended-client-before-send-SendMessage",
-		"pysqs-extended-client-before-send-SendMessageBatch",
-	]
+	client.sqs.meta.events.emit("before-send.sqs.GetQueueAttributes", request=None)
+	assert client._sqs_send_attempt_count() == 2
+	assert _before_send_hook_ids(sqs) == ["pysqs-extended-client-before-send"]
 
 
 def test_before_send_count_stays_on_the_calling_thread():
@@ -365,33 +371,21 @@ def test_botocore_client_with_replaced_events_keeps_a_timeout():
 	client.close()
 
 
-def test_shared_sqs_client_keeps_one_handler_until_the_last_close():
+def test_close_leaves_the_shared_before_send_handler():
 	sqs = _bare_sqs()
 	first = _wrapped(sqs)
 	second = _wrapped(sqs)
 	assert first._send_attempt_tracker is second._send_attempt_tracker
-	assert len(_before_send_hook_ids(sqs)) == 2
+	assert _before_send_hook_ids(sqs) == ["pysqs-extended-client-before-send"]
+	first.close()
+	second.close()
+	assert first._sqs_attempt_hook_registered is True
+	assert first._send_attempt_tracker is second._send_attempt_tracker
+	assert _before_send_hook_ids(sqs) == ["pysqs-extended-client-before-send"]
 	first._reset_sqs_send_attempts()
 	sqs.meta.events.emit("before-send.sqs.SendMessage", request=None)
-	assert first._sqs_send_attempt_count() == 1
+	assert first._sqs_send_was_attempted() is True
 	assert second._sqs_send_was_attempted() is True
-	first.close()
-	assert len(_before_send_hook_ids(sqs)) == 2
-	second._reset_sqs_send_attempts()
-	sqs.meta.events.emit("before-send.sqs.SendMessage", request=None)
-	assert second._sqs_send_was_attempted() is True
-	assert first._sqs_send_attempt_count() == 0
-	second.close()
-	assert _before_send_hook_ids(sqs) == []
-	third = _wrapped(sqs)
-	third._reset_sqs_send_attempts()
-	sqs.meta.events.emit("before-send.sqs.SendMessageBatch", request=None)
-	assert third._sqs_send_was_attempted() is True
-	assert len(_before_send_hook_ids(sqs)) == 2
-	third.close()
-	third.close()
-	assert _before_send_hook_ids(sqs) == []
-	assert third._sqs_send_attempt_count() == 0
 
 
 def test_extended_clients_sharing_one_sqs_client_are_collected():
@@ -402,10 +396,95 @@ def test_extended_clients_sharing_one_sqs_client_are_collected():
 		refs.append(weakref.ref(client))
 	del client
 	hook_ids = _before_send_hook_ids(sqs)
-	assert len(hook_ids) == 2
+	assert hook_ids == ["pysqs-extended-client-before-send"]
 	handlers = sqs.meta.events._emitter._unique_id_handlers
 	for hook_id in hook_ids:
 		assert not isinstance(handlers[hook_id]["handler"].__self__, SQSClientExtended)
 	gc.collect()
 	assert [ref() for ref in refs] == [None] * len(refs)
-	assert len(_before_send_hook_ids(sqs)) == 2
+	assert _before_send_hook_ids(sqs) == ["pysqs-extended-client-before-send"]
+
+
+def _assert_refresh_retry_kept_the_object(server, state, client, s3, events, operation):
+	expected_objects = _offloaded_count(operation)
+	assert server.hits == ["/"]
+	assert state["calls"] == 2
+	assert client._sqs_attempt_hook_registered is True
+	assert client._send_attempt_tracker is not None
+	assert client._sqs_send_was_attempted() is True
+	assert s3.delete_calls == []
+	assert len(s3.objects) == expected_objects
+	assert _before_send_hook_ids(client.sqs) == ["pysqs-extended-client-before-send"]
+	cases = [fields["case"] for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
+	assert cases == [ORPHAN_AFTER_SQS_UNCERTAIN] * expected_objects
+
+
+@pytest.mark.parametrize("operation", ["send_message", "send_message_batch"])
+def test_send_after_close_keeps_the_object_when_refresh_fails_on_retry(operation):
+	state = {"calls": 0, "fail_immediately": False, "error": NoCredentialsError()}
+	events = []
+	with _sqs_server(500) as server:
+		client, s3 = _extended_client(server, _refresh(state), events)
+		client.close()
+		with pytest.raises(NoCredentialsError):
+			_send(client, operation)
+		_assert_refresh_retry_kept_the_object(server, state, client, s3, events, operation)
+
+
+@pytest.mark.parametrize("operation", ["send_message", "send_message_batch"])
+def test_close_from_another_thread_during_send_keeps_the_object(operation):
+	state = {"calls": 0, "fail_immediately": False, "error": NoCredentialsError()}
+	events = []
+	with _sqs_server(500, hold_first=True) as server:
+		client, s3 = _extended_client(server, _refresh(state), events, read_timeout=10)
+
+		def close_after_attempt():
+			assert server.first_hit.wait(timeout=5)
+			client.close()
+			server.allow_response.set()
+
+		closer = threading.Thread(target=close_after_attempt)
+		closer.start()
+		try:
+			with pytest.raises(NoCredentialsError):
+				_send(client, operation)
+		finally:
+			server.allow_response.set()
+			closer.join(timeout=5)
+		assert not closer.is_alive()
+		_assert_refresh_retry_kept_the_object(server, state, client, s3, events, operation)
+
+
+def test_unhashable_sqs_client_still_records_before_send():
+	sqs = _bare_sqs()
+
+	class _Eq(type(sqs)):
+		def __eq__(self, other):
+			return self is other
+
+	sqs.__class__ = _Eq
+	with pytest.raises(TypeError):
+		hash(sqs)
+	first = _wrapped(sqs)
+	second = _wrapped(sqs)
+	assert first._sqs_attempt_hook_registered is True
+	assert first._send_attempt_tracker is second._send_attempt_tracker
+	first._reset_sqs_send_attempts()
+	sqs.meta.events.emit("before-send.sqs.SendMessage", request=None)
+	assert first._sqs_send_was_attempted() is True
+	assert second._sqs_send_was_attempted() is True
+	assert _before_send_hook_ids(sqs) == ["pysqs-extended-client-before-send"]
+	first.close()
+	assert first._sqs_attempt_hook_registered is True
+	assert _before_send_hook_ids(sqs) == ["pysqs-extended-client-before-send"]
+
+
+def test_tracker_is_dropped_when_the_sqs_client_is_collected():
+	sqs = _bare_sqs()
+	client = _wrapped(sqs)
+	client_id = id(sqs)
+	assert client_id in _SEND_ATTEMPT_TRACKERS
+	del client
+	del sqs
+	gc.collect()
+	assert client_id not in _SEND_ATTEMPT_TRACKERS

@@ -89,11 +89,17 @@ ORPHAN_AFTER_SQS_SUCCEEDED = "after_sqs_succeeded"
 ORPHAN_AFTER_UPLOAD_SQS_REJECTED = "after_upload_sqs_rejected"
 ORPHAN_AFTER_SQS_UNCERTAIN = "after_sqs_uncertain"
 _CONFIRMED_S3_NOT_FOUND_CODES = frozenset(("NoSuchKey", "404", "NotFound"))
-_SQS_SEND_ATTEMPT_OPERATIONS = ("SendMessage", "SendMessageBatch")
+_SQS_SEND_ATTEMPT_EVENTS = frozenset((
+	"before-send.sqs.SendMessage",
+	"before-send.sqs.SendMessageBatch",
+))
 _SQS_SEND_ATTEMPT_HOOK_PREFIX = "pysqs-extended-client-before-send"
-# One tracker per botocore SQS client. The before-send handler holds the tracker,
-# not an extended client, so wrappers created per request can be collected.
-_SEND_ATTEMPT_TRACKERS = weakref.WeakKeyDictionary()
+# id(sqs client) -> tracker. A weakref drops the entry when that client is
+# collected. id() is used so a BaseClient that defines __eq__ and is therefore
+# unhashable still gets a handler. The handler holds the tracker, not an
+# extended client, and it is not removed by close().
+_SEND_ATTEMPT_TRACKERS = {}
+_SEND_ATTEMPT_REFS = {}
 _SEND_ATTEMPT_TRACKERS_LOCK = threading.Lock()
 
 
@@ -103,13 +109,14 @@ class _SendAttemptTracker:
 	def __init__(self):
 		self._local = threading.local()
 		self.lock = threading.Lock()
-		self.users = 0
 		self.registered = False
 
 	def reset(self):
 		self._local.count = 0
 
-	def note(self, **kwargs):
+	def note(self, event_name=None, **kwargs):
+		if event_name not in _SQS_SEND_ATTEMPT_EVENTS:
+			return
 		self._local.count = getattr(self._local, "count", 0) + 1
 
 	def was_attempted(self):
@@ -117,6 +124,13 @@ class _SendAttemptTracker:
 
 	def count(self):
 		return getattr(self._local, "count", 0)
+
+
+def _forget_send_attempt_tracker(dead_ref, client_id):
+	with _SEND_ATTEMPT_TRACKERS_LOCK:
+		if _SEND_ATTEMPT_REFS.get(client_id) is dead_ref:
+			_SEND_ATTEMPT_TRACKERS.pop(client_id, None)
+			_SEND_ATTEMPT_REFS.pop(client_id, None)
 
 
 def _live_sqs_events(sqs):
@@ -134,15 +148,18 @@ def _live_sqs_events(sqs):
 
 def _tracker_for(sqs):
 	with _SEND_ATTEMPT_TRACKERS_LOCK:
-		tracker = _SEND_ATTEMPT_TRACKERS.get(sqs)
-		if tracker is None:
-			tracker = _SendAttemptTracker()
-			_SEND_ATTEMPT_TRACKERS[sqs] = tracker
+		client_id = id(sqs)
+		ref = _SEND_ATTEMPT_REFS.get(client_id)
+		tracker = _SEND_ATTEMPT_TRACKERS.get(client_id)
+		if tracker is not None and ref is not None and ref() is sqs:
+			return tracker
+		tracker = _SendAttemptTracker()
+		_SEND_ATTEMPT_REFS[client_id] = weakref.ref(
+			sqs,
+			lambda dead, client_id=client_id: _forget_send_attempt_tracker(dead, client_id),
+		)
+		_SEND_ATTEMPT_TRACKERS[client_id] = tracker
 		return tracker
-
-
-def _send_attempt_hook_id(operation):
-	return "%s-%s" % (_SQS_SEND_ATTEMPT_HOOK_PREFIX, operation)
 
 
 class SQSClientExtended:
@@ -195,7 +212,6 @@ class SQSClientExtended:
 		# boto3 retries on the calling thread; the count itself is thread-local.
 		self._send_attempt_tracker = None
 		self._sqs_attempt_hook_registered = False
-		self._hook_released = True
 		self._register_sqs_send_attempt_hook()
 		self._reject_delete_s3_before_sqs()
 		self.config.freeze()
@@ -303,7 +319,13 @@ class SQSClientExtended:
 			)
 
 	def close(self):
-		self._release_sqs_send_attempt_hook()
+		"""Stop the S3 thread pool.
+
+		Does not unregister the before-send handler and does not clear this
+		instance's tracker. A send after ``close()``, and a send already in
+		flight, still records ``before-send``. The handler stays registered
+		for the SQS client's lifetime.
+		"""
 		with self._pool_lock:
 			pool = self._pool
 			self._pool = None
@@ -1066,9 +1088,10 @@ class SQSClientExtended:
 		already emitted it. The callback can raise any exception.
 
 		The handler is the tracker's ``note`` method. It does not reference
-		this extended client. ``unique_id`` is per SQS client and operation, so
-		another wrapper of the same client does not add a handler. Injected
-		clients that are not botocore clients keep the type-based fallback.
+		this extended client. One ``unique_id`` per SQS client means another
+		wrapper does not add a handler. ``close()`` leaves the handler in
+		place. Injected clients that are not botocore clients keep the
+		type-based fallback.
 		"""
 		if self._sqs_attempt_hook_registered:
 			return
@@ -1077,39 +1100,15 @@ class SQSClientExtended:
 			return
 		tracker = _tracker_for(self.sqs)
 		with tracker.lock:
-			tracker.users += 1
 			if not tracker.registered:
-				for operation in _SQS_SEND_ATTEMPT_OPERATIONS:
-					events.register(
-						"before-send.sqs.%s" % operation,
-						tracker.note,
-						unique_id=_send_attempt_hook_id(operation),
-					)
+				events.register(
+					"before-send.sqs",
+					tracker.note,
+					unique_id=_SQS_SEND_ATTEMPT_HOOK_PREFIX,
+				)
 				tracker.registered = True
 		self._send_attempt_tracker = tracker
 		self._sqs_attempt_hook_registered = True
-		self._hook_released = False
-
-	def _release_sqs_send_attempt_hook(self):
-		"""Drop this wrapper's use of the shared before-send handler."""
-		if self._hook_released:
-			return
-		self._hook_released = True
-		self._sqs_attempt_hook_registered = False
-		tracker = self._send_attempt_tracker
-		self._send_attempt_tracker = None
-		if tracker is not None:
-			events = _live_sqs_events(self.sqs)
-			with tracker.lock:
-				if tracker.users > 0:
-					tracker.users -= 1
-				if tracker.users == 0 and tracker.registered and events is not None:
-					for operation in _SQS_SEND_ATTEMPT_OPERATIONS:
-						events.unregister(
-							"before-send.sqs.%s" % operation,
-							unique_id=_send_attempt_hook_id(operation),
-						)
-					tracker.registered = False
 
 	def _reset_sqs_send_attempts(self):
 		tracker = self._send_attempt_tracker
