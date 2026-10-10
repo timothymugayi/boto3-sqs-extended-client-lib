@@ -1,7 +1,13 @@
 import re
 
+from pysqs_extended_client.server_side_encryption import ServerSideEncryptionStrategy
+
 
 DEFAULT_MESSAGE_SIZE_THRESHOLD = 262144
+# SQS rejects a message body larger than 256 KiB. A threshold above that would
+# try to send inline and fail at the service instead of offloading.
+MIN_MESSAGE_SIZE_THRESHOLD = 1
+MAX_MESSAGE_SIZE_THRESHOLD = DEFAULT_MESSAGE_SIZE_THRESHOLD
 DEFAULT_MAX_POOL_CONNECTIONS = 50
 DEFAULT_CONNECT_TIMEOUT = 3
 DEFAULT_READ_TIMEOUT = 60
@@ -19,7 +25,19 @@ class FrozenConfigError(RuntimeError):
 
 
 class ExtendedClientConfiguration:
-	"""Options that control large-payload offload and worker-scale client settings."""
+	"""Options that control large-payload offload and worker-scale client settings.
+
+	Checked at construction (and on later assignment, until the client freezes the
+	config):
+
+	* ``message_size_threshold`` is an int from 1 to 262144, or ``None`` for 262144.
+	* ``s3_bucket_name`` is ``None`` or a non-blank ``str``. Surrounding whitespace
+	  is stripped. A blank string raises ``ValueError``.
+	* ``server_side_encryption`` is ``None`` or a ``ServerSideEncryptionStrategy``.
+
+	``SQSClientExtended`` additionally requires a bucket when
+	``payload_support_enabled`` is true, because that is when a send can offload.
+	"""
 
 	def __init__(
 		self,
@@ -65,7 +83,8 @@ class ExtendedClientConfiguration:
 		self.payload_support_enabled = payload_support_enabled
 		# Java deletes the S3 object before DeleteMessage. That leaves a dead
 		# pointer when SQS delete fails. The default here deletes SQS first and
-		# then best-effort cleans S3. Set delete_s3_before_sqs=True for the Java order.
+		# then best-effort cleans S3. Set delete_s3_before_sqs=True for the Java
+		# order. SQSClientExtended logs one warning at init when this is true.
 		self.delete_s3_before_sqs = delete_s3_before_sqs
 		self.on_event = on_event
 
@@ -84,7 +103,67 @@ class ExtendedClientConfiguration:
 			)
 		if name == "s3_key_prefix":
 			value = self.validate_s3_key_prefix(value)
+		elif name == "message_size_threshold":
+			value = self.validate_message_size_threshold(value)
+		elif name == "s3_bucket_name":
+			value = self.validate_s3_bucket_name(value)
+		elif name == "server_side_encryption":
+			value = self.validate_server_side_encryption(value)
 		object.__setattr__(self, name, value)
+
+	@staticmethod
+	def validate_message_size_threshold(message_size_threshold):
+		if isinstance(message_size_threshold, bool) or not isinstance(message_size_threshold, int):
+			raise TypeError(
+				"message_size_threshold must be an int from {} to {} "
+				"(the SQS maximum message size is {} bytes), got {}.".format(
+					MIN_MESSAGE_SIZE_THRESHOLD,
+					MAX_MESSAGE_SIZE_THRESHOLD,
+					MAX_MESSAGE_SIZE_THRESHOLD,
+					type(message_size_threshold).__name__,
+				)
+			)
+		if (
+			message_size_threshold < MIN_MESSAGE_SIZE_THRESHOLD
+			or message_size_threshold > MAX_MESSAGE_SIZE_THRESHOLD
+		):
+			raise ValueError(
+				"message_size_threshold must be from {} to {} bytes "
+				"(the SQS message size limit). Got {}.".format(
+					MIN_MESSAGE_SIZE_THRESHOLD,
+					MAX_MESSAGE_SIZE_THRESHOLD,
+					message_size_threshold,
+				)
+			)
+		return message_size_threshold
+
+	@staticmethod
+	def validate_s3_bucket_name(s3_bucket_name):
+		if s3_bucket_name is None:
+			return None
+		if not isinstance(s3_bucket_name, str):
+			raise TypeError(
+				"s3_bucket_name must be a str or None, got {}.".format(type(s3_bucket_name).__name__)
+			)
+		trimmed = s3_bucket_name.strip()
+		if not trimmed:
+			raise ValueError(
+				"s3_bucket_name cannot be blank. Omit it (None) or pass a non-empty bucket name."
+			)
+		return trimmed
+
+	@staticmethod
+	def validate_server_side_encryption(server_side_encryption):
+		if server_side_encryption is None:
+			return None
+		if not isinstance(server_side_encryption, ServerSideEncryptionStrategy):
+			raise TypeError(
+				"server_side_encryption must be a ServerSideEncryptionStrategy "
+				"or None, got {}. Use aws_managed_cmk(), customer_key(...), or sse_s3().".format(
+					type(server_side_encryption).__name__
+				)
+			)
+		return server_side_encryption
 
 	@staticmethod
 	def validate_s3_key_prefix(s3_key_prefix):

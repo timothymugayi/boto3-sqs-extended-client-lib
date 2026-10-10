@@ -4,7 +4,7 @@ Boto3 SQS Extended Client Library for Python
 [![Tests](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/actions/workflows/tests.yml)
 [![codecov](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib/branch/master/graph/badge.svg)](https://codecov.io/gh/timothymugayi/boto3-sqs-extended-client-lib)
 
-The **Amazon SQS Extended Client Library for Python** (version **0.4.0**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit) and puts a pointer on the queue.
+The **Amazon SQS Extended Client Library for Python** (version **0.4.1**) is modelled after the original [Amazon SQS Extended Client for Java](https://github.com/awslabs/amazon-sqs-java-extended-client-lib). It stores large SQS payloads in Amazon S3 (over the 256 KB SQS limit) and puts a pointer on the queue.
 
 You can:
 
@@ -25,13 +25,13 @@ You can:
 
 Requires Python 3.9+.
 
-After **0.4.0** is on PyPI:
+After **0.4.1** is on PyPI:
 
 ```bash
-pip install "pysqs-extended-client>=0.4.0"
+pip install "pysqs-extended-client>=0.4.1"
 ```
 
-PyPI project `pysqs-extended-client` still serves **0.0.1** only ([issue #19](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/issues/19)). Until the maintainer publishes 0.4.0, install from this repository:
+PyPI project `pysqs-extended-client` still serves **0.0.1** only ([issue #19](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/issues/19)). Until the maintainer publishes 0.4.1, install from this repository:
 
 ```bash
 pip install "pysqs-extended-client @ git+https://github.com/timothymugayi/boto3-sqs-extended-client-lib.git"
@@ -47,7 +47,7 @@ Hold this wrapper as your only SQS client. Send, receive, and delete through it 
 
 Call style differs from boto3: methods take positional `queue_url` / `message` instead of `QueueUrl=` / `MessageBody=`. Extra boto3 fields still work as kwargs (`DelaySeconds`, `VisibilityTimeout`). `receive_message` returns a **list of messages** (an empty queue returns `[]`), not boto3's `{"Messages": [...]}` dict and not `None`.
 
-Access keys passed to the constructor are handed to boto3 and are not kept on the instance. Prefer the default credential chain or injected clients.
+Access keys passed to the constructor are handed to boto3 and are not kept on the instance. Pass both the access key and the secret, or omit both and use the default credential chain (region alone is enough for that). A key without its secret raises `ValueError` at construction. Prefer the default credential chain or injected clients.
 
 ```python
 from pysqs_extended_client import SQSClientExtended, ExtendedClientConfiguration
@@ -110,7 +110,7 @@ sqs = SQSClientExtended(
         s3_bucket_name="my-payload-bucket",
         s3_key_prefix="payloads/",
         # optional: always_through_s3=True,
-        # optional: message_size_threshold=262144,  # default 256 KiB
+        # optional: message_size_threshold=262144,  # int, 1..262144; default 256 KiB
     ),
 )
 
@@ -164,11 +164,29 @@ sqs = SQSClientExtended(
 
 Configure the client **before** constructing it. After `SQSClientExtended` is created the config is frozen (unlike the Java client, which is documented as not thread-safe). `set_always_through_s3` and `set_message_size_threshold` are not part of the API.
 
-Inject boto3 clients when you need custom credentials, endpoints, or session configuration. Do not look for a separate `config.py` module. Omit access keys to use the default credential chain.
+Inject boto3 clients when you need custom credentials, endpoints, or session configuration. Do not look for a separate `config.py` module. Omit both access keys to use the default credential chain. Setting only one of them raises `ValueError`.
+
+### Fail-fast checks (0.4.1)
+
+These run when `ExtendedClientConfiguration` or `SQSClientExtended` is created.
+
+* **Bucket.** With `payload_support_enabled=True` (the default), a send can offload: every message if `always_through_s3=True`, otherwise any message larger than `message_size_threshold`. Construction raises `ValueError` when the effective bucket is missing. That error used to wait until the first offload (`S3 bucket name cannot be null`). A constructor name that differs from `config.s3_bucket_name` raises `ValueError` instead of ignoring the constructor. The same name in both places is fine; a constructor name fills an empty config. Whitespace-only is `ValueError`. A non-string is `TypeError`.
+
+  Small-only processes that never offload, hydrate, or delete S3 payloads omit the bucket by setting `payload_support_enabled=False`. That is the supported no-bucket mode. `always_through_s3` does nothing there. Receive-only workers that hydrate pointers should still set `s3_bucket_name`. Receive reads the bucket from the pointer; the init check exists so a later send cannot fail on a missing bucket.
+
+* **`message_size_threshold`.** An int from 1 through 262144 (the SQS 256 KiB limit), default 262144. `None` selects the default. Outside that range is `ValueError`. Booleans and other types are `TypeError`. A larger threshold would try to send a body SQS rejects.
+
+* **Credentials.** Set `aws_access_key_id` and `aws_secret_access_key` together, or omit both. One without the other raises `ValueError`. A half-specified pair used to be dropped, and boto3 used the default chain. Region alone still uses that chain. Both keys are passed even when region is omitted; they used to be dropped unless region was set. Whitespace-only values count as omitted. Non-string key or region values raise `TypeError`.
+
+* **`server_side_encryption`.** `None` or a `ServerSideEncryptionStrategy` (`aws_managed_cmk()`, `customer_key(...)`, `sse_s3()`). Anything else is `TypeError` at config construction. A wrong object used to fail later, when the upload called `extra_args`.
+
+* **`delete_s3_before_sqs=True`.** One warning at client construction about the dead-pointer risk (S3 is removed before the SQS delete). The error log when that delete then fails is unchanged.
+
+* **`ignore_payload_not_found`.** When a missing S3 object causes the SQS message to be deleted, the client still logs a warning. If `on_event` is set, it is called as `payload_missing_deleted` with `queue_url`, `s3_bucket_name`, `s3_key`, and `receipt_handle`.
 
 ### Server-side encryption
 
-`server_side_encryption` is the analog of Java `ServerSideEncryptionStrategy`. It is merged into S3 `ExtraArgs` next to `s3_canned_acl`:
+`server_side_encryption` is the analog of Java `ServerSideEncryptionStrategy`. It must be one of the strategies below (or omitted). Other objects raise `TypeError` when the config is created. It is merged into S3 `ExtraArgs` next to `s3_canned_acl`:
 
 * `aws_managed_cmk()` — SSE-KMS with the AWS-managed `aws/s3` key (`ServerSideEncryption=aws:kms`), same as Java `AwsManagedCmk`.
 * `customer_key("alias/my-key")` or a key id — SSE-KMS with that CMK, same as Java `CustomerKey`.
@@ -183,7 +201,7 @@ Default delete order is **SQS first**, then a best-effort S3 delete.
 * If `DeleteMessage` fails, the S3 object is still there. Retry the delete after the visibility timeout.
 * If the SQS delete succeeds and the S3 delete fails, the queue message is gone and the object is orphaned. The error is logged and not raised.
 
-The Java extended client deletes S3 **first**. If SQS delete then fails, the message stays on the queue and points at a missing object (a dead pointer). Receipt-handle markers are the same either way, so Java consumers can still read messages this client sent. Set `delete_s3_before_sqs=True` only if you need that Java failure mode. This client logs an error when that path creates a dead pointer.
+The Java extended client deletes S3 **first**. If SQS delete then fails, the message stays on the queue and points at a missing object (a dead pointer). Receipt-handle markers are the same either way, so Java consumers can still read messages this client sent. Set `delete_s3_before_sqs=True` only if you need that Java failure mode. Construction logs one warning when the flag is set. This client also logs an error when that path creates a dead pointer.
 
 `purge_queue` clears SQS only. S3 objects are left behind.
 

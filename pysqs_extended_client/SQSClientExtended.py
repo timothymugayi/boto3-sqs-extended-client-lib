@@ -21,6 +21,38 @@ from pysqs_extended_client.extended_config import ExtendedClientConfiguration
 logger = logging.getLogger(__name__)
 
 
+def _blank_to_none(value):
+	"""Treat None and whitespace-only strings as omitted."""
+	if value is None:
+		return None
+	if not isinstance(value, str):
+		raise TypeError(
+			"Credential and region values must be str or None, got {}.".format(type(value).__name__)
+		)
+	stripped = value.strip()
+	return stripped or None
+
+
+def _validate_credential_pair(aws_access_key_id, aws_secret_access_key):
+	"""Require both explicit keys, or neither.
+
+	A region on its own stays valid: boto3 then uses the default credential chain.
+	Blank strings count as omitted so padding cannot look like a half-specified pair.
+	"""
+	access_key = _blank_to_none(aws_access_key_id)
+	secret_key = _blank_to_none(aws_secret_access_key)
+	if (access_key is None) != (secret_key is None):
+		present = "aws_access_key_id" if access_key is not None else "aws_secret_access_key"
+		missing = "aws_secret_access_key" if access_key is not None else "aws_access_key_id"
+		raise ValueError(
+			"{} is set but {} is missing. Set both aws_access_key_id and "
+			"aws_secret_access_key, or omit both to use the default credential chain. "
+			"A half-specified pair is not passed to boto3 and is not ignored. "
+			"aws_region_name may be set on its own.".format(present, missing)
+		)
+	return access_key, secret_key
+
+
 class SQSExtendedClientConstants(Enum):
 	DEFAULT_MESSAGE_SIZE_THRESHOLD = 262144
 	MAX_ALLOWED_ATTRIBUTES = 10 - 1  # 10 for SQS, 1 for the reserved attribute
@@ -43,6 +75,12 @@ class SQSClientExtended:
 	The four-argument constructor stays compatible with existing callers.
 	Configure scale knobs on ExtendedClientConfiguration before constructing the client;
 	the config is frozen after __init__.
+
+	When ``payload_support_enabled`` is true (the default), a non-blank bucket name
+	is required here. Offload can happen for every message (``always_through_s3``)
+	or for any message over ``message_size_threshold``. Small-only callers that
+	must not offload or hydrate set ``payload_support_enabled=False`` and may omit
+	the bucket. Access key and secret must both be set or both omitted.
 	"""
 
 	def __init__(
@@ -59,32 +97,88 @@ class SQSClientExtended:
 			self.config = ExtendedClientConfiguration(s3_bucket_name=s3_bucket_name)
 		else:
 			self.config = config
-			if s3_bucket_name and not self.config.s3_bucket_name:
-				self.config.s3_bucket_name = s3_bucket_name
+			self._apply_bucket_argument(s3_bucket_name)
 		# Keys are passed only into boto3 and are not retained on this instance.
 		# Omit them to use the default credential chain (env, shared file, role).
+		# Checked even when callers inject clients, so a half-specified pair is never ignored.
+		access_key, secret_key = _validate_credential_pair(aws_access_key_id, aws_secret_access_key)
+		self._require_bucket_if_offload_can_happen()
 		self.sqs = sqs_client if sqs_client is not None else self._build_client(
-			"sqs", aws_access_key_id, aws_secret_access_key, aws_region_name
+			"sqs", access_key, secret_key, aws_region_name
 		)
 		self.s3 = s3_client if s3_client is not None else self._build_client(
-			"s3", aws_access_key_id, aws_secret_access_key, aws_region_name
+			"s3", access_key, secret_key, aws_region_name
 		)
 		self._pool = None
 		self._pool_lock = threading.Lock()
+		if self.config.delete_s3_before_sqs:
+			logger.warning(
+				"delete_s3_before_sqs=True deletes the S3 payload before the SQS message. "
+				"If the SQS delete then fails, the message stays on the queue and points at a "
+				"missing object (a dead pointer). The default is SQS first, then best-effort S3 cleanup."
+			)
 		self.config.freeze()
+
+	def _apply_bucket_argument(self, s3_bucket_name):
+		"""Use the constructor bucket, unless config already names a different one."""
+		if s3_bucket_name is None:
+			return
+		ctor_bucket = ExtendedClientConfiguration.validate_s3_bucket_name(s3_bucket_name)
+		config_bucket = self.config.s3_bucket_name
+		if config_bucket and ctor_bucket != config_bucket:
+			raise ValueError(
+				"s3_bucket_name passed to SQSClientExtended ({!r}) does not match "
+				"ExtendedClientConfiguration.s3_bucket_name ({!r}). "
+				"Pass the bucket in one place, or use the same name in both. "
+				"The constructor value is not ignored.".format(ctor_bucket, config_bucket)
+			)
+		if not config_bucket:
+			self.config.s3_bucket_name = ctor_bucket
+
+	def _require_bucket_if_offload_can_happen(self):
+		"""Fail at init when a later send could offload and no bucket is configured.
+
+		``payload_support_enabled=False`` is the small-only mode: nothing is
+		offloaded, hydrated, or deleted in S3, so a bucket is not required.
+		``always_through_s3`` does not offload in that mode.
+		"""
+		if not self.config.payload_support_enabled:
+			return
+		bucket = self.config.s3_bucket_name
+		if isinstance(bucket, str) and bucket.strip():
+			return
+		if self.config.always_through_s3:
+			reason = "always_through_s3=True stores every payload in S3"
+		else:
+			reason = (
+				"payload_support_enabled=True stores any message larger than "
+				"message_size_threshold (%s bytes) in S3" % self.config.message_size_threshold
+			)
+		raise ValueError(
+			"s3_bucket_name is required when constructing SQSClientExtended because {}. "
+			"Pass a non-blank bucket name to SQSClientExtended or ExtendedClientConfiguration. "
+			"To use the client for small inline messages only, set payload_support_enabled=False. "
+			"That mode does not offload, hydrate, or delete S3 payloads, so a bucket is not required. "
+			"always_through_s3 has no effect when payload support is disabled. "
+			"Receive-only clients that hydrate pointers should still set s3_bucket_name "
+			"(receive reads the bucket from the pointer; the check is so a later send "
+			"cannot fail on a missing bucket).".format(reason)
+		)
 
 	def _build_client(self, service_name, aws_access_key_id, aws_secret_access_key, aws_region_name):
 		kwargs = {"config": self._botocore_config()}
 		if self.config.endpoint_url:
 			kwargs["endpoint_url"] = self.config.endpoint_url
-		if aws_access_key_id and aws_secret_access_key and aws_region_name:
-			kwargs.update(
-				aws_access_key_id=aws_access_key_id,
-				aws_secret_access_key=aws_secret_access_key,
-				region_name=aws_region_name,
-			)
-		elif aws_region_name and not (aws_access_key_id or aws_secret_access_key):
-			kwargs["region_name"] = aws_region_name
+		access_key = _blank_to_none(aws_access_key_id)
+		secret_key = _blank_to_none(aws_secret_access_key)
+		region = _blank_to_none(aws_region_name)
+		# Both keys are passed whenever they are set, including when region is omitted.
+		# Previously they were dropped unless region was set too.
+		if access_key is not None:
+			kwargs["aws_access_key_id"] = access_key
+			kwargs["aws_secret_access_key"] = secret_key
+		if region is not None:
+			kwargs["region_name"] = region
 		return boto3.client(service_name, **kwargs)
 
 	def _botocore_config(self):
@@ -427,15 +521,13 @@ class SQSClientExtended:
 			if index in errors:
 				exc = errors[index]
 				if isinstance(exc, ClientError) and self._is_missing_s3_object(exc) and self.config.ignore_payload_not_found:
-					self.sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=message.get("ReceiptHandle"))
-					logger.warning("Message deleted from SQS since payload with pointer could not be found in S3.")
+					self._delete_message_with_missing_payload(queue_url, message, s3_bucket_name, s3_key)
 					continue
 				raise exc
 			orig_msg_body = bodies.get(index)
 			if orig_msg_body is None:
 				if self.config.ignore_payload_not_found:
-					self.sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=message.get("ReceiptHandle"))
-					logger.warning("Message deleted from SQS since payload with pointer could not be found in S3.")
+					self._delete_message_with_missing_payload(queue_url, message, s3_bucket_name, s3_key)
 					continue
 				raise ValueError("S3 payload was not found for key {}".format(s3_key))
 			if filename:
@@ -488,6 +580,19 @@ class SQSClientExtended:
 	def _hydrate_from_s3(self, s3_bucket_name, s3_key, as_binary=False, filename=None):
 		return self.get_payload_from_s3(
 			s3_bucket_name, s3_key, as_binary=as_binary, filename=filename
+		)
+
+	def _delete_message_with_missing_payload(self, queue_url, message, s3_bucket_name, s3_key):
+		"""Delete an SQS message whose S3 payload is gone and tell on_event, if set."""
+		receipt_handle = message.get("ReceiptHandle")
+		self.sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+		logger.warning("Message deleted from SQS since payload with pointer could not be found in S3.")
+		self._emit(
+			"payload_missing_deleted",
+			queue_url=queue_url,
+			s3_bucket_name=s3_bucket_name,
+			s3_key=s3_key,
+			receipt_handle=receipt_handle,
 		)
 
 	def _is_missing_s3_object(self, exc):
