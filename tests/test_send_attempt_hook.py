@@ -4,21 +4,30 @@ The SQS client here is a real botocore client. Attempt 1 hits a local HTTP
 server; the retry re-signs and the refresh callback raises.
 """
 import datetime
+import gc
 import threading
+import weakref
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import MagicMock
 
 import boto3
 import botocore.session
 import pytest
 from botocore.config import Config
 from botocore.credentials import RefreshableCredentials
-from botocore.exceptions import ClientError, NoCredentialsError, ParamValidationError
+from botocore.exceptions import (
+	ClientError,
+	NoCredentialsError,
+	ParamValidationError,
+	ReadTimeoutError,
+)
 
 from pysqs_extended_client.SQSClientExtended import (
 	EVENT_S3_OBJECT_ORPHANED,
 	ORPHAN_AFTER_SQS_UNCERTAIN,
 	SQSClientExtended,
+	_SQS_SEND_ATTEMPT_HOOK_PREFIX,
 )
 from pysqs_extended_client.extended_config import ExtendedClientConfiguration
 from tests.fakes import FakeS3
@@ -132,6 +141,33 @@ def _offloaded_count(operation):
 	return 2
 
 
+def _bare_sqs():
+	return boto3.client(
+		"sqs",
+		region_name="us-east-1",
+		aws_access_key_id="AKIAtesttesttest",
+		aws_secret_access_key="secretsecretsecret",
+		endpoint_url="http://127.0.0.1:9",
+	)
+
+
+def _wrapped(sqs, events=None):
+	return SQSClientExtended(
+		sqs_client=sqs,
+		s3_client=FakeS3(),
+		config=ExtendedClientConfiguration(
+			s3_bucket_name="test-bucket",
+			always_through_s3=True,
+			on_event=None if events is None else (lambda name, **fields: events.append((name, fields))),
+		),
+	)
+
+
+def _before_send_hook_ids(sqs):
+	handlers = sqs.meta.events._emitter._unique_id_handlers
+	return sorted(key for key in handlers if str(key).startswith(_SQS_SEND_ATTEMPT_HOOK_PREFIX))
+
+
 def _send(client, operation):
 	if operation == "send_message":
 		client.send_message(QUEUE_URL, "hello")
@@ -241,42 +277,28 @@ def test_attempt_flag_resets_before_the_next_send():
 
 
 def test_before_send_hook_is_registered_once_per_operation():
-	sqs = boto3.client(
-		"sqs",
-		region_name="us-east-1",
-		aws_access_key_id="AKIAtesttesttest",
-		aws_secret_access_key="secretsecretsecret",
-		endpoint_url="http://127.0.0.1:9",
-	)
-	client = SQSClientExtended(
-		sqs_client=sqs,
-		s3_client=FakeS3(),
-		config=ExtendedClientConfiguration(s3_bucket_name="test-bucket"),
-	)
+	sqs = _bare_sqs()
+	client = _wrapped(sqs)
 	client._register_sqs_send_attempt_hook()
 	client._reset_sqs_send_attempts()
 	client.sqs.meta.events.emit("before-send.sqs.SendMessage", request=None)
 	client.sqs.meta.events.emit("before-send.sqs.SendMessageBatch", request=None)
-	assert client._sqs_send_attempts.count == 2
+	assert client._sqs_send_attempt_count() == 2
+	assert _before_send_hook_ids(sqs) == [
+		"pysqs-extended-client-before-send-SendMessage",
+		"pysqs-extended-client-before-send-SendMessageBatch",
+	]
 
 
 def test_before_send_count_stays_on_the_calling_thread():
-	sqs = boto3.client(
-		"sqs",
-		region_name="us-east-1",
-		aws_access_key_id="AKIAtesttesttest",
-		aws_secret_access_key="secretsecretsecret",
-		endpoint_url="http://127.0.0.1:9",
-	)
-	client = SQSClientExtended(
-		sqs_client=sqs,
-		s3_client=FakeS3(),
-		config=ExtendedClientConfiguration(s3_bucket_name="test-bucket"),
-	)
+	sqs = _bare_sqs()
+	first = _wrapped(sqs)
+	second = _wrapped(sqs)
+	assert first._send_attempt_tracker is second._send_attempt_tracker
 	barrier = threading.Barrier(2)
 	results = {}
 
-	def run(name, reset):
+	def run(client, name, reset):
 		client._reset_sqs_send_attempts()
 		barrier.wait()
 		client.sqs.meta.events.emit("before-send.sqs.SendMessage", request=None)
@@ -287,11 +309,103 @@ def test_before_send_count_stays_on_the_calling_thread():
 		results[name] = client._sqs_send_was_attempted()
 
 	threads = [
-		threading.Thread(target=run, args=("reset", True)),
-		threading.Thread(target=run, args=("keep", False)),
+		threading.Thread(target=run, args=(first, "reset", True)),
+		threading.Thread(target=run, args=(second, "keep", False)),
 	]
 	for thread in threads:
 		thread.start()
 	for thread in threads:
 		thread.join()
 	assert results == {"reset": False, "keep": True}
+
+
+@pytest.mark.parametrize("operation", ["send_message", "send_message_batch"])
+def test_magicmock_read_timeout_keeps_the_object(operation):
+	"""A mock register never emits, so a timeout must stay uncertain."""
+	sqs = MagicMock()
+	error = ReadTimeoutError(endpoint_url="https://sqs.us-east-1.amazonaws.com/")
+	getattr(sqs, operation).side_effect = error
+	events = []
+	client = _wrapped(sqs, events)
+	s3 = client.s3
+	expected_objects = _offloaded_count(operation)
+	assert client._sqs_attempt_hook_registered is False
+	assert sqs.meta.events.register.call_count == 0
+	with pytest.raises(ReadTimeoutError):
+		_send(client, operation)
+	assert s3.delete_calls == []
+	assert len(s3.objects) == expected_objects
+	assert client._sqs_send_was_attempted() is False
+	assert client._sqs_send_attempt_count() == 0
+	cases = [fields["case"] for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
+	assert cases == [ORPHAN_AFTER_SQS_UNCERTAIN] * expected_objects
+	client.close()
+	client.close()
+
+
+def test_botocore_client_with_replaced_events_keeps_a_timeout():
+	"""BaseClient alone is not enough; meta.events must be a real emitter."""
+	sqs = _bare_sqs()
+	sqs.meta.events = MagicMock()
+
+	def send_message(**kwargs):
+		raise ReadTimeoutError(endpoint_url="https://sqs.us-east-1.amazonaws.com/")
+
+	sqs.send_message = send_message
+	events = []
+	client = _wrapped(sqs, events)
+	assert client._sqs_attempt_hook_registered is False
+	assert sqs.meta.events.register.call_count == 0
+	with pytest.raises(ReadTimeoutError):
+		client.send_message(QUEUE_URL, "hello")
+	assert client.s3.delete_calls == []
+	assert len(client.s3.objects) == 1
+	cases = [fields["case"] for name, fields in events if name == EVENT_S3_OBJECT_ORPHANED]
+	assert cases == [ORPHAN_AFTER_SQS_UNCERTAIN]
+	client.close()
+
+
+def test_shared_sqs_client_keeps_one_handler_until_the_last_close():
+	sqs = _bare_sqs()
+	first = _wrapped(sqs)
+	second = _wrapped(sqs)
+	assert first._send_attempt_tracker is second._send_attempt_tracker
+	assert len(_before_send_hook_ids(sqs)) == 2
+	first._reset_sqs_send_attempts()
+	sqs.meta.events.emit("before-send.sqs.SendMessage", request=None)
+	assert first._sqs_send_attempt_count() == 1
+	assert second._sqs_send_was_attempted() is True
+	first.close()
+	assert len(_before_send_hook_ids(sqs)) == 2
+	second._reset_sqs_send_attempts()
+	sqs.meta.events.emit("before-send.sqs.SendMessage", request=None)
+	assert second._sqs_send_was_attempted() is True
+	assert first._sqs_send_attempt_count() == 0
+	second.close()
+	assert _before_send_hook_ids(sqs) == []
+	third = _wrapped(sqs)
+	third._reset_sqs_send_attempts()
+	sqs.meta.events.emit("before-send.sqs.SendMessageBatch", request=None)
+	assert third._sqs_send_was_attempted() is True
+	assert len(_before_send_hook_ids(sqs)) == 2
+	third.close()
+	third.close()
+	assert _before_send_hook_ids(sqs) == []
+	assert third._sqs_send_attempt_count() == 0
+
+
+def test_extended_clients_sharing_one_sqs_client_are_collected():
+	sqs = _bare_sqs()
+	refs = []
+	for _ in range(200):
+		client = _wrapped(sqs)
+		refs.append(weakref.ref(client))
+	del client
+	hook_ids = _before_send_hook_ids(sqs)
+	assert len(hook_ids) == 2
+	handlers = sqs.meta.events._emitter._unique_id_handlers
+	for hook_id in hook_ids:
+		assert not isinstance(handlers[hook_id]["handler"].__self__, SQSClientExtended)
+	gc.collect()
+	assert [ref() for ref in refs] == [None] * len(refs)
+	assert len(_before_send_hook_ids(sqs)) == 2
