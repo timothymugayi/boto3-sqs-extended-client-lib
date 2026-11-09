@@ -105,3 +105,7 @@ We use GitHub issues for tracking bugs and feature requests.
 
 * Give feedback [here](https://github.com/timothymugayi/boto3-sqs-extended-client-lib/issues).
 * If you'd like to contribute a new feature or bug fix, go ahead submit a pull request.
+
+[![Buy Me a Coffee](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=☕&slug=timothymugayi&button_colour=FFDD00&font_colour=000000&font_family=Inter&outline_colour=000000&coffee_colour=ffffff)](https://buymeacoffee.com/timothymugayi)
+
+If this library keeps your large SQS payloads moving, a coffee helps me keep it maintained, tested and up to date with boto3.
